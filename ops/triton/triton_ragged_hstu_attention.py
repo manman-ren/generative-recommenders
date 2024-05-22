@@ -344,7 +344,10 @@ def _ragged_hstu_attn_fwd_one_block(  # noqa: C901
 
 
 @triton.autotune(
-    configs=_get_fw_configs(),
+    #configs=_get_fw_configs(),
+    configs=[
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=2, num_warps=4),
+    ],
     key=[
         "Z",
         "H",
