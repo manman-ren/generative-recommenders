@@ -17,6 +17,7 @@
 # pyre-unsafe
 
 from typing import List, Optional
+import numpy as np
 
 import torch
 
@@ -210,8 +211,10 @@ def _ragged_hstu_attn_fwd_one_block(  # noqa: C901
     offs_n,
     mask_m,
     q,
-    K_block_ptr,
-    V_block_ptr,
+    K_desc_ptr,
+    V_desc_ptr,
+    offset_h,
+    seq_start,
     n_targets,
     ts_1_ptrs,
     ts_0,
@@ -237,14 +240,25 @@ def _ragged_hstu_attn_fwd_one_block(  # noqa: C901
     HAS_ATTN_SCALE: tl.constexpr,
     IS_DELTA_Q: tl.constexpr,
     ALLOW_TF32: tl.constexpr,
+    BLOCK_D_Q: tl.constexpr,
+    BLOCK_D_V: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     start_n = tl.multiple_of(start_n, BLOCK_N)
     mask_n = offs_n < seq_len - start_n
     # -- compute qk ----
-    k = tl.load(K_block_ptr, boundary_check=(1,), padding_option="zero")
-    qk = tl.dot(q, k, allow_tf32=ALLOW_TF32) * alpha
+    k = tl._experimental_descriptor_load(
+        K_desc_ptr,
+        [(seq_start + start_n).to(tl.int32), offset_h.to(tl.int32)],
+        [BLOCK_N, BLOCK_D_Q],
+        tl.bfloat16,
+    )
+    qk = tl.dot(q, tl.trans(k), allow_tf32=ALLOW_TF32) * alpha
+    #qk = tl.dot(k, tl.trans(q), allow_tf32=ALLOW_TF32) * alpha
+    #qk = tl.trans(qk)
+    #k = tl.load(K_block_ptr, boundary_check=(1,), padding_option="zero")
+    #qk = tl.dot(q, k, allow_tf32=ALLOW_TF32) * alpha
     if ATTN_BIAS_TYPE == "fused":
         attn_bias = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         if USE_TIME_BIAS:
@@ -338,7 +352,13 @@ def _ragged_hstu_attn_fwd_one_block(  # noqa: C901
     if HAS_ATTN_SCALE:
         silu = silu * attn_scale[:, None]
 
-    v = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")
+    #v = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")
+    v = tl._experimental_descriptor_load(
+        V_desc_ptr,
+        [(seq_start + start_n).to(tl.int32), offset_h.to(tl.int32)],
+        [BLOCK_N, BLOCK_D_V],
+        tl.bfloat16,
+    )
     silu = silu.to(v.dtype)
     return tl.dot(silu, v, allow_tf32=ALLOW_TF32)
 
@@ -454,22 +474,22 @@ def _ragged_hstu_attn_fwd(  # noqa C901
             block_shape=(BLOCK_M, BLOCK_D_Q),
             order=(1, 0),
         )
-    K_block_ptr = tl.make_block_ptr(
-        base=K + off_h * stride_kh + seq_start * stride_kn,
-        shape=(BLOCK_D_Q, seq_len),
-        strides=(1, stride_kn),
-        offsets=(0, 0),
-        block_shape=(BLOCK_D_Q, BLOCK_N),
-        order=(0, 1),
-    )
-    V_block_ptr = tl.make_block_ptr(
-        base=V + off_h * stride_vh + seq_start * stride_vn,
-        shape=(seq_len, BLOCK_D_V),
-        strides=(stride_vn, 1),
-        offsets=(0, 0),
-        block_shape=(BLOCK_N, BLOCK_D_V),
-        order=(1, 0),
-    )
+    #K_block_ptr = tl.make_block_ptr(
+    #    base=K + off_h * stride_kh + seq_start * stride_kn,
+    #    shape=(BLOCK_D_Q, seq_len),
+    #    strides=(1, stride_kn),
+    #    offsets=(0, 0),
+    #    block_shape=(BLOCK_D_Q, BLOCK_N),
+    #    order=(0, 1),
+    #)
+    #V_block_ptr = tl.make_block_ptr(
+    #    base=V + off_h * stride_vh + seq_start * stride_vn,
+    #    shape=(seq_len, BLOCK_D_V),
+    #    strides=(stride_vn, 1),
+    #    offsets=(0, 0),
+    #    block_shape=(BLOCK_N, BLOCK_D_V),
+    #    order=(1, 0),
+    #)
     mask_m = offs_m < seq_len
     if ATTN_BIAS_TYPE == "fused" and USE_TIME_BIAS:
         ts_0_ptrs = TS + off_z * stride_ts + offs_m
@@ -505,8 +525,8 @@ def _ragged_hstu_attn_fwd(  # noqa C901
         elif INVALID_MASK_TYPE == "upper_triangular":
             low = start_m // BLOCK_N * BLOCK_N
             high = seq_len
-            K_block_ptr = tl.advance(K_block_ptr, (0, low))
-            V_block_ptr = tl.advance(V_block_ptr, (low, 0))
+            #K_block_ptr = tl.advance(K_block_ptr, (0, low))
+            #V_block_ptr = tl.advance(V_block_ptr, (low, 0))
 
     # pyre-ignore[61]
     for start_n in range(low, high, BLOCK_N):
@@ -517,8 +537,12 @@ def _ragged_hstu_attn_fwd(  # noqa C901
             offs_n=offs_n,
             mask_m=mask_m,
             q=q,
-            K_block_ptr=K_block_ptr,
-            V_block_ptr=V_block_ptr,
+            #K_block_ptr=K_block_ptr,
+            K_desc_ptr=K,
+            #V_block_ptr=V_block_ptr,
+            V_desc_ptr=V,
+            offset_h=off_h * stride_vh,
+            seq_start=seq_start,
             # pyre-ignore[61]
             n_targets=n_targets if HAS_MULTIPLE_TARGETS else None,
             ts_1_ptrs=(
@@ -553,20 +577,22 @@ def _ragged_hstu_attn_fwd(  # noqa C901
             HAS_ATTN_SCALE=HAS_ATTN_SCALE,
             IS_DELTA_Q=IS_DELTA_Q,
             ALLOW_TF32=ALLOW_TF32,
+            BLOCK_D_Q=BLOCK_D_Q,
+            BLOCK_D_V=BLOCK_D_V,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
         )
-        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
-        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
+        #K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
+        #V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
 
     if HAS_MULTIPLE_TARGETS and INVALID_MASK_TYPE == "lower_triangular":
         # pyre-ignore[61]
         if uih_end < start_m:
             low_delta = start_m
             high_delta = start_m + BLOCK_M
-            offset = (low_delta - uih_end).to(tl.int32)  # pyre-ignore [61]
-            K_block_ptr = tl.advance(K_block_ptr, (0, offset))
-            V_block_ptr = tl.advance(V_block_ptr, (offset, 0))
+            #offset = (low_delta - uih_end).to(tl.int32)  # pyre-ignore [61]
+            #K_block_ptr = tl.advance(K_block_ptr, (0, offset))
+            #V_block_ptr = tl.advance(V_block_ptr, (offset, 0))
             for start_delta in range(low_delta, high_delta, BLOCK_N):
                 acc += _ragged_hstu_attn_fwd_one_block(
                     start_n=start_delta,
@@ -575,8 +601,12 @@ def _ragged_hstu_attn_fwd(  # noqa C901
                     offs_n=offs_n,
                     mask_m=mask_m,
                     q=q,
-                    K_block_ptr=K_block_ptr,
-                    V_block_ptr=V_block_ptr,
+                    #K_block_ptr=K_block_ptr,
+                    K_desc_ptr=K,
+                    #V_block_ptr=V_block_ptr,
+                    V_desc_ptr=V,
+                    offset_h=off_h * stride_vh,
+                    seq_start=seq_start,
                     # pyre-ignore[61]
                     n_targets=n_targets if HAS_MULTIPLE_TARGETS else None,
                     ts_1_ptrs=(
@@ -615,11 +645,13 @@ def _ragged_hstu_attn_fwd(  # noqa C901
                     HAS_ATTN_SCALE=HAS_ATTN_SCALE,
                     IS_DELTA_Q=IS_DELTA_Q,
                     ALLOW_TF32=ALLOW_TF32,
+                    BLOCK_D_Q=BLOCK_D_Q,
+                    BLOCK_D_V=BLOCK_D_V,
                     BLOCK_M=BLOCK_M,
                     BLOCK_N=BLOCK_N,
                 )
-                K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
-                V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
+                #K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
+                #V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
 
     if IS_DELTA_Q:
         start_m_delta = tl.program_id(0) * BLOCK_M
@@ -673,6 +705,31 @@ class _RaggedAttentionFunction(torch.autograd.Function):
         has_attn_bias = attn_bias is not None
         has_attn_scale = attn_scale is not None
 
+        TMA_SIZE = 128
+        BLOCK_N, BLOCK_D_V, BLOCK_D_Q = 64, DimV, DimQ
+        desc_k = np.empty(TMA_SIZE, dtype=np.int8)
+        desc_v = np.empty(TMA_SIZE, dtype=np.int8)
+        triton.runtime.driver.active.utils.fill_2d_tma_descriptor(
+            k.data_ptr(),
+            L,
+            H * DimQ,
+            BLOCK_N,
+            BLOCK_D_Q,
+            k.element_size(),
+            desc_k,
+        )
+        triton.runtime.driver.active.utils.fill_2d_tma_descriptor(
+            v.data_ptr(),
+            L,
+            H * DimV,
+            BLOCK_N,
+            BLOCK_D_V,
+            v.element_size(),
+            desc_v,
+        )
+        desc_k = torch.tensor(desc_k, device=v.device)
+        desc_v = torch.tensor(desc_v, device=v.device)
+
         grid = lambda meta: (  # noqa E731
             triton.cdiv(N, meta["BLOCK_M"]),
             Z * H,
@@ -689,8 +746,8 @@ class _RaggedAttentionFunction(torch.autograd.Function):
 
         _ragged_hstu_attn_fwd[grid](
             Q=q,
-            K=k,
-            V=v,
+            K=desc_k,
+            V=desc_v,
             seq_offsets=seq_offsets,
             TS=None,
             TW=None,
@@ -772,9 +829,35 @@ class _RaggedAttentionRelativeBiasFunction(torch.autograd.Function):
         has_attn_scale = attn_scale is not None
         has_multiple_targets = num_targets is not None
         has_max_pos_id = max_pos_ind is not None
-        _, H, DimQ = q.shape
+        L, H, DimQ = q.shape
         _, _, DimV = v.shape
         out = torch.empty_like(v)
+
+        TMA_SIZE = 128
+        BLOCK_N, BLOCK_D_V, BLOCK_D_Q = 64, DimV, DimQ
+        desc_k = np.empty(TMA_SIZE, dtype=np.int8)
+        desc_v = np.empty(TMA_SIZE, dtype=np.int8)
+        triton.runtime.driver.active.utils.fill_2d_tma_descriptor(
+            k.data_ptr(),
+            L,
+            H * DimQ,
+            BLOCK_N,
+            BLOCK_D_Q,
+            k.element_size(),
+            desc_k,
+        )
+        triton.runtime.driver.active.utils.fill_2d_tma_descriptor(
+            v.data_ptr(),
+            L,
+            H * DimV,
+            BLOCK_N,
+            BLOCK_D_V,
+            v.element_size(),
+            desc_v,
+        )
+        desc_k = torch.tensor(desc_k, device=v.device)
+        desc_v = torch.tensor(desc_v, device=v.device)
+
         grid = lambda meta: (  # noqa E731
             triton.cdiv(N, meta["BLOCK_M"]),
             Z * H,
@@ -792,8 +875,8 @@ class _RaggedAttentionRelativeBiasFunction(torch.autograd.Function):
 
         _ragged_hstu_attn_fwd[grid](
             Q=q,
-            K=k,
-            V=v,
+            K=desc_k,
+            V=desc_v,
             seq_offsets=seq_offsets,
             TS=timestamps,
             TW=ts_weights,
