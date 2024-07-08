@@ -525,6 +525,11 @@ def _ragged_hstu_attn_fwd(  # noqa C901
             #K_block_ptr = tl.advance(K_block_ptr, (0, low))
             #V_block_ptr = tl.advance(V_block_ptr, (low, 0))
 
+    tl.inline_asm_elementwise("fence.proxy.tensormap::generic.acquire.gpu [$1], 128; // $0 dummy reg", "=r, l",
+                            [K], dtype=tl.int32, is_pure=False, pack=1)
+    tl.inline_asm_elementwise("fence.proxy.tensormap::generic.acquire.gpu [$1], 128; // $0 dummy reg", "=r, l",
+                            [V], dtype=tl.int32, is_pure=False, pack=1)
+
     # pyre-ignore[61]
     for start_n in range(low, high, BLOCK_N):
         acc += _ragged_hstu_attn_fwd_one_block(
@@ -831,7 +836,10 @@ class _RaggedAttentionRelativeBiasFunction(torch.autograd.Function):
         out = torch.empty_like(v)
 
         TMA_SIZE = 128
-        BLOCK_N, BLOCK_D_V, BLOCK_D_Q = 64, DimV, DimQ
+        BLOCK_D_V, BLOCK_D_Q = DimV, DimQ
+        desc_k = torch.empty((TMA_SIZE), device="cuda", dtype=torch.int8)
+        desc_v = torch.empty((TMA_SIZE), device="cuda", dtype=torch.int8)
+        '''
         desc_k = np.empty(TMA_SIZE, dtype=np.int8)
         desc_v = np.empty(TMA_SIZE, dtype=np.int8)
         triton.runtime.driver.active.utils.fill_2d_tma_descriptor(
@@ -854,11 +862,29 @@ class _RaggedAttentionRelativeBiasFunction(torch.autograd.Function):
         )
         desc_k = torch.tensor(desc_k, device=v.device)
         desc_v = torch.tensor(desc_v, device=v.device)
+        '''
 
-        grid = lambda meta: (  # noqa E731
-            triton.cdiv(N, meta["BLOCK_M"]),
-            Z * H,
-        )
+        def grid2(META):
+            nonlocal desc_k
+            nonlocal desc_v
+            #a_buf = torch.empty(TMA_SIZE, dtype=torch.int8)
+            k_buf = torch.empty_like(desc_k, device="cpu")
+            v_buf = torch.empty_like(desc_v, device="cpu")
+            #desc_a = desc_a.numpy()  # if start with cuda, will need cpu() here
+            #desc_b = desc_b.numpy()
+            #desc_c = desc_c.numpy()
+            #print("enter grid2", META['BLOCK_M'], META['BLOCK_K'])
+            triton.runtime.driver.active.utils.fill_2d_tma_descriptor(k.data_ptr(), L, H * DimQ, META['BLOCK_N'], BLOCK_D_Q, k.element_size(),
+                                                                      k_buf.numpy())
+            triton.runtime.driver.active.utils.fill_2d_tma_descriptor(v.data_ptr(), L, H * DimV, META['BLOCK_N'], BLOCK_D_V, v.element_size(),
+                                                                      v_buf.numpy())
+            #desc_a = torch.tensor(desc_a, device="cuda")
+            #desc_b = torch.tensor(desc_b, device="cuda")
+            #desc_c = torch.tensor(desc_c, device="cuda")
+            desc_k.copy_(k_buf)
+            desc_v.copy_(v_buf)
+            return (cdiv(N, meta["BLOCK_M"]), Z * H, 1)
+
         stride_sz = 0
         stride_sm = 0
         if attn_scale is not None:
@@ -870,7 +896,7 @@ class _RaggedAttentionRelativeBiasFunction(torch.autograd.Function):
         use_time_bias = relative_bias_type == "TIME" or relative_bias_type == "ALL"
         use_pos_bias = relative_bias_type == "POSITION" or relative_bias_type == "ALL"
 
-        _ragged_hstu_attn_fwd[grid](
+        _ragged_hstu_attn_fwd[grid2](
             Q=q,
             K=desc_k,
             V=desc_v,
