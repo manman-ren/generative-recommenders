@@ -60,138 +60,8 @@ def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
     else:
         configs = [
             triton.Config(
-                {"BLOCK_M": 32, "BLOCK_N": 32},
-                num_stages=2,
-                num_warps=2,
-            ),
-            triton.Config(
-                {"BLOCK_M": 32, "BLOCK_N": 32},
-                num_stages=4,
-                num_warps=2,
-            ),
-            triton.Config(
-                {"BLOCK_M": 32, "BLOCK_N": 32},
-                num_stages=2,
-                num_warps=4,
-            ),
-            triton.Config(
-                {"BLOCK_M": 32, "BLOCK_N": 32},
-                num_stages=4,
-                num_warps=4,
-            ),
-            triton.Config(
-                {"BLOCK_M": 32, "BLOCK_N": 64},
-                num_stages=2,
-                num_warps=4,
-            ),
-            triton.Config(
-                {"BLOCK_M": 32, "BLOCK_N": 64},
-                num_stages=4,
-                num_warps=4,
-            ),
-            triton.Config(
-                {"BLOCK_M": 32, "BLOCK_N": 64},
-                num_stages=4,
-                num_warps=8,
-            ),
-            triton.Config(
-                {"BLOCK_M": 32, "BLOCK_N": 128},
-                num_stages=2,
-                num_warps=4,
-            ),
-            triton.Config(
-                {"BLOCK_M": 32, "BLOCK_N": 128},
-                num_stages=2,
-                num_warps=8,
-            ),
-            triton.Config(
-                {"BLOCK_M": 64, "BLOCK_N": 32},
-                num_stages=4,
-                num_warps=2,
-            ),
-            triton.Config(
-                {"BLOCK_M": 64, "BLOCK_N": 32},
-                num_stages=2,
-                num_warps=4,
-            ),
-            triton.Config(
-                {"BLOCK_M": 64, "BLOCK_N": 32},
-                num_stages=4,
-                num_warps=4,
-            ),
-            triton.Config(
-                {"BLOCK_M": 64, "BLOCK_N": 32},
-                num_stages=2,
-                num_warps=8,
-            ),
-            triton.Config(
                 {"BLOCK_M": 64, "BLOCK_N": 64},
                 num_stages=2,
-                num_warps=2,
-            ),
-            triton.Config(
-                {"BLOCK_M": 64, "BLOCK_N": 64},
-                num_stages=2,
-                num_warps=4,
-            ),
-            triton.Config(
-                {"BLOCK_M": 64, "BLOCK_N": 64},
-                num_stages=4,
-                num_warps=4,
-            ),
-            triton.Config(
-                {"BLOCK_M": 64, "BLOCK_N": 64},
-                num_stages=4,
-                num_warps=8,
-            ),
-            triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 32},
-                num_stages=2,
-                num_warps=2,
-            ),
-            triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 32},
-                num_stages=4,
-                num_warps=2,
-            ),
-            triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 32},
-                num_stages=2,
-                num_warps=4,
-            ),
-            triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 32},
-                num_stages=4,
-                num_warps=4,
-            ),
-            triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 32},
-                num_stages=2,
-                num_warps=8,
-            ),
-            triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 32},
-                num_stages=4,
-                num_warps=8,
-            ),
-            triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 64},
-                num_stages=2,
-                num_warps=4,
-            ),
-            triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 64},
-                num_stages=2,
-                num_warps=8,
-            ),
-            triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 64},
-                num_stages=4,
-                num_warps=8,
-            ),
-            triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 128},
-                num_stages=4,
                 num_warps=4,
             ),
             triton.Config(
@@ -526,9 +396,9 @@ def _ragged_hstu_attn_fwd(  # noqa C901
             #V_block_ptr = tl.advance(V_block_ptr, (low, 0))
 
     tl.inline_asm_elementwise("fence.proxy.tensormap::generic.acquire.gpu [$1], 128; // $0 dummy reg", "=r, l",
-                            [K], dtype=tl.int32, is_pure=False, pack=1)
+                              [K], dtype=tl.int32, is_pure=False, pack=1)
     tl.inline_asm_elementwise("fence.proxy.tensormap::generic.acquire.gpu [$1], 128; // $0 dummy reg", "=r, l",
-                            [V], dtype=tl.int32, is_pure=False, pack=1)
+                              [V], dtype=tl.int32, is_pure=False, pack=1)
 
     # pyre-ignore[61]
     for start_n in range(low, high, BLOCK_N):
@@ -883,7 +753,7 @@ class _RaggedAttentionRelativeBiasFunction(torch.autograd.Function):
             #desc_c = torch.tensor(desc_c, device="cuda")
             desc_k.copy_(k_buf)
             desc_v.copy_(v_buf)
-            return (cdiv(N, meta["BLOCK_M"]), Z * H, 1)
+            return (triton.cdiv(N, META["BLOCK_M"]), Z * H, 1)
 
         stride_sz = 0
         stride_sm = 0

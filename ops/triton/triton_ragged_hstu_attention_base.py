@@ -59,66 +59,6 @@ def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
     else:
         configs = [
             triton.Config(
-                {"BLOCK_M": 32, "BLOCK_N": 32},
-                num_stages=2,
-                num_warps=2,
-            ),
-            triton.Config(
-                {"BLOCK_M": 32, "BLOCK_N": 32},
-                num_stages=4,
-                num_warps=2,
-            ),
-            triton.Config(
-                {"BLOCK_M": 32, "BLOCK_N": 32},
-                num_stages=2,
-                num_warps=4,
-            ),
-            triton.Config(
-                {"BLOCK_M": 32, "BLOCK_N": 32},
-                num_stages=4,
-                num_warps=4,
-            ),
-            triton.Config(
-                {"BLOCK_M": 32, "BLOCK_N": 64},
-                num_stages=2,
-                num_warps=4,
-            ),
-            triton.Config(
-                {"BLOCK_M": 32, "BLOCK_N": 64},
-                num_stages=4,
-                num_warps=4,
-            ),
-            triton.Config(
-                {"BLOCK_M": 32, "BLOCK_N": 64},
-                num_stages=4,
-                num_warps=8,
-            ),
-            triton.Config(
-                {"BLOCK_M": 32, "BLOCK_N": 128},
-                num_stages=2,
-                num_warps=4,
-            ),
-            triton.Config(
-                {"BLOCK_M": 32, "BLOCK_N": 128},
-                num_stages=2,
-                num_warps=8,
-            ),
-            triton.Config(
-                {"BLOCK_M": 64, "BLOCK_N": 32},
-                num_stages=4,
-                num_warps=2,
-            ),
-            triton.Config(
-                {"BLOCK_M": 64, "BLOCK_N": 32},
-                num_stages=2,
-                num_warps=4,
-            ),
-            triton.Config(
-                {"BLOCK_M": 64, "BLOCK_N": 32},
-                num_stages=4,
-                num_warps=4,
-            ),
-            triton.Config(
                 {"BLOCK_M": 64, "BLOCK_N": 32},
                 num_stages=2,
                 num_warps=8,
@@ -132,71 +72,6 @@ def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
                 {"BLOCK_M": 64, "BLOCK_N": 64},
                 num_stages=2,
                 num_warps=4,
-            ),
-            triton.Config(
-                {"BLOCK_M": 64, "BLOCK_N": 64},
-                num_stages=4,
-                num_warps=4,
-            ),
-            triton.Config(
-                {"BLOCK_M": 64, "BLOCK_N": 64},
-                num_stages=4,
-                num_warps=8,
-            ),
-            triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 32},
-                num_stages=2,
-                num_warps=2,
-            ),
-            triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 32},
-                num_stages=4,
-                num_warps=2,
-            ),
-            triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 32},
-                num_stages=2,
-                num_warps=4,
-            ),
-            triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 32},
-                num_stages=4,
-                num_warps=4,
-            ),
-            triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 32},
-                num_stages=2,
-                num_warps=8,
-            ),
-            triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 32},
-                num_stages=4,
-                num_warps=8,
-            ),
-            triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 64},
-                num_stages=2,
-                num_warps=4,
-            ),
-            triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 64},
-                num_stages=2,
-                num_warps=8,
-            ),
-            triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 64},
-                num_stages=4,
-                num_warps=8,
-            ),
-            triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 128},
-                num_stages=4,
-                num_warps=4,
-            ),
-            triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 128},
-                num_stages=2,
-                num_warps=8,
             ),
         ]
     return configs
