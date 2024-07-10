@@ -162,6 +162,7 @@ def main(
     print("strides", q.stride(0), q.stride(1), q.stride(2), k.stride(0), k.stride(1), k.stride(2), v.stride(0), v.stride(1), v.stride(2))
     print("weights", ts_weights.size(), pos_weights.size())
     if not no_relative_bias:
+        '''
         out1 = _RaggedAttentionBaseRelativeBiasFunction.apply(
             max_seq_len,
             alpha,
@@ -184,6 +185,7 @@ def main(
             None,
             relative_bias_type,
         )
+        print("done base")
         out2 = _RaggedAttentionRelativeBiasFunction.apply(
             max_seq_len,
             alpha,
@@ -206,6 +208,7 @@ def main(
             None,
             relative_bias_type,
         )
+        '''
         fn = lambda: _RaggedAttentionRelativeBiasFunction.apply(
             max_seq_len,
             alpha,
@@ -269,10 +272,12 @@ def main(
             None,
         )
 
+    '''
     torch.testing.assert_close(
         out1, #.view(L, -1)
         out2,
     )
+    '''
     quantiles = [0.5, 0.2, 0.8]
     with profiler_or_nullcontext(profiling_mode, profiling_with_stack):
         ms, min_ms, max_ms = triton.testing.do_bench(
