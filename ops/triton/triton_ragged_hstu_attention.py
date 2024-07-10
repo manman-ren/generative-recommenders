@@ -26,6 +26,7 @@ import triton
 
 # @manual=//triton:triton
 import triton.language as tl
+from triton.tools.experimental_descriptor import create_1d_tma_descriptor, create_2d_tma_descriptor
 
 try:
     # @manual=//triton:triton
@@ -366,7 +367,7 @@ def _ragged_hstu_attn_fwd_one_block(  # noqa: C901
 @triton.autotune(
     #configs=_get_fw_configs(),
     configs=[
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_stages=2, num_warps=8),
     ],
     key=[
         "Z",
@@ -834,7 +835,9 @@ class _RaggedAttentionRelativeBiasFunction(torch.autograd.Function):
         out = torch.empty_like(v)
 
         TMA_SIZE = 128
-        BLOCK_N, BLOCK_D_V, BLOCK_D_Q = 64, DimV, DimQ
+        # TODO: should be the same as the tuning config
+        BLOCK_N, BLOCK_D_V, BLOCK_D_Q = 32, DimV, DimQ
+        '''
         desc_k = np.empty(TMA_SIZE, dtype=np.int8)
         desc_v = np.empty(TMA_SIZE, dtype=np.int8)
         triton.runtime.driver.active.utils.fill_2d_tma_descriptor(
@@ -857,7 +860,18 @@ class _RaggedAttentionRelativeBiasFunction(torch.autograd.Function):
         )
         desc_k = torch.tensor(desc_k, device=v.device)
         desc_v = torch.tensor(desc_v, device=v.device)
-
+        '''
+        desc_k = create_2d_tma_descriptor(k.data_ptr(), L,
+            H * DimQ,
+            BLOCK_N,
+            BLOCK_D_Q,
+            k.element_size())
+        desc_v = create_2d_tma_descriptor(v.data_ptr(),
+            L,
+            H * DimV,
+            BLOCK_N,
+            BLOCK_D_V,
+            v.element_size())
         grid = lambda meta: (  # noqa E731
             triton.cdiv(N, meta["BLOCK_M"]),
             Z * H,
