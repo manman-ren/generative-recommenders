@@ -18,6 +18,7 @@
 
 from typing import List, Optional
 
+import sys
 import torch
 
 # @manual=//triton:triton
@@ -33,6 +34,98 @@ except ImportError:
     # pyre-ignore: Undefined import [21]
     # @manual=//triton:triton
     from triton.language.math import fast_dividef
+
+# check if we have the TMA version in Triton PR #4498 (https://github.com/triton-lang/triton/pull/4498).
+HAS_TMA_DESC = "nv_tma_desc_type" in dir(tl)
+
+if HAS_TMA_DESC:
+    print(
+        "TMA benchmarks will be running with experimental grid constant TMA descriptor.",
+        file=sys.stderr,
+    )
+else:
+    print(
+        "TMA benchmarks will be running without grid constant TMA descriptor.",
+        file=sys.stderr,
+    )
+
+
+class TmaAutoTuneHelper:
+
+    # duck typing wrapper to implement the same interface as TmaDescKernelParam in Triton PR #4498
+    class KernelParamWrapper:
+        def __init__(self, desc):
+            self.desc = desc
+
+        def tma_desc_cpu_ptr(self):
+            return self.desc.data_ptr()
+
+    TMA_SIZE = 128
+
+    def __init__(self):
+        self.fill_1d_tma_descriptor_inner = (
+            triton.runtime.driver.active.utils.fill_1d_tma_descriptor
+        )
+        self.fill_2d_tma_descriptor_inner = (
+            triton.runtime.driver.active.utils.fill_2d_tma_descriptor
+        )
+        if HAS_TMA_DESC:
+            self.descriptors = {}
+        else:
+            self.cuda_descriptors = {}
+
+    # Call this method outside of the lambda function for grid size
+    def init_tma_descriptor(self, name):
+        if HAS_TMA_DESC:
+            self.descriptors[name] = torch.empty(
+                TmaAutoTuneHelper.TMA_SIZE, device="cpu", dtype=torch.int8
+            )
+        else:
+            self.cuda_descriptors[name] = torch.empty(
+                TmaAutoTuneHelper.TMA_SIZE, device="cuda", dtype=torch.int8
+            )
+
+    # Call this method inside the lambda function for grid size
+    def fill_1d_tma_descriptor(self, name, ptr, dim, block_dim, element_size):
+        if HAS_TMA_DESC:
+            desc_x = self.descriptors[name]
+            assert desc_x.data_ptr() % 64 == 0
+            self.fill_1d_tma_descriptor_inner(
+                ptr, dim, block_dim, element_size, desc_x.data_ptr()
+            )
+        else:
+            desc_x = self.cuda_descriptors[name]
+            buf_x = torch.empty_like(desc_x, device="cpu", pin_memory=True)
+            self.fill_1d_tma_descriptor_inner(
+                ptr, dim, block_dim, element_size, buf_x.data_ptr()
+            )
+            desc_x.copy_(buf_x, non_blocking=True)
+
+    # Call this method inside the lambda function for grid size
+    def fill_2d_tma_descriptor(
+        self, name, ptr, dim1, dim0, block_dim1, block_dim0, element_size
+    ):
+        if HAS_TMA_DESC:
+            desc_x = self.descriptors[name]
+            assert desc_x.data_ptr() % 64 == 0
+            self.fill_2d_tma_descriptor_inner(
+                ptr, dim1, dim0, block_dim1, block_dim0, element_size, desc_x.data_ptr()
+            )
+        else:
+            desc_x = self.cuda_descriptors[name]
+            buf_x = torch.empty_like(desc_x, device="cpu", pin_memory=True)
+            self.fill_2d_tma_descriptor_inner(
+                ptr, dim1, dim0, block_dim1, block_dim0, element_size, buf_x.data_ptr()
+            )
+            desc_x.copy_(buf_x, non_blocking=True)
+
+    def get_tma_descriptor_kernel_param(self, name):
+        if HAS_TMA_DESC:
+            assert self.descriptors[name] is not None
+            return self.KernelParamWrapper(self.descriptors[name])
+        else:
+            assert self.cuda_descriptors[name] is not None
+            return self.cuda_descriptors[name]
 
 
 def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
@@ -123,11 +216,11 @@ def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
                 num_stages=4,
                 num_warps=4,
             ),
-            triton.Config(
-                {"BLOCK_M": 64, "BLOCK_N": 32},
-                num_stages=2,
-                num_warps=8,
-            ),
+            #triton.Config(
+            #    {"BLOCK_M": 64, "BLOCK_N": 32},
+            #    num_stages=2,
+            #    num_warps=8,
+            #),
             triton.Config(
                 {"BLOCK_M": 64, "BLOCK_N": 64},
                 num_stages=2,
@@ -143,11 +236,11 @@ def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
                 num_stages=4,
                 num_warps=4,
             ),
-            triton.Config(
-                {"BLOCK_M": 64, "BLOCK_N": 64},
-                num_stages=4,
-                num_warps=8,
-            ),
+            #triton.Config(
+            #    {"BLOCK_M": 64, "BLOCK_N": 64},
+            #    num_stages=4,
+            #    num_warps=8,
+            #),
             triton.Config(
                 {"BLOCK_M": 128, "BLOCK_N": 32},
                 num_stages=2,
@@ -204,6 +297,86 @@ def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
                 num_warps=8,
             ),
         ]
+
+        #for config in base_configs:
+        #    for tma_config in [False, True]:
+        #        configs.append(
+        #            triton.Config(
+        #                {
+        #                    "BLOCK_M": config.kwargs["BLOCK_M"], "BLOCK_N": config.kwargs["BLOCK_N"],
+        #                    "enable_tma": tma_config
+        #                },
+        #                num_stages=config.num_stages,
+        #                num_warps=config.num_warps,
+        #            )
+        #        )
+
+    return configs
+
+
+def _get_best_config():
+    configs = [
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 128},
+            num_stages=2,
+            num_warps=8,
+        ),
+    ]
+    return configs;
+
+
+def _get_fw_configs_noWS():
+    configs = []
+    for config in _get_best_config(): # _get_best_config(): #_get_fw_configs():
+        configs.append(
+            triton.Config(
+                {
+                    "BLOCK_M": config.kwargs["BLOCK_M"], "BLOCK_N": config.kwargs["BLOCK_N"]
+                },
+                num_stages=config.num_stages,
+                num_warps=config.num_warps,
+                num_buffers_warp_spec=0, # 2,3,4
+                num_consumer_groups=0
+            )
+        )
+    return configs
+
+
+def _get_fw_configs_WS():
+    configs = []
+    for config in _get_best_config(): # _get_best_config(): #_get_fw_configs():
+        configs.append(
+            triton.Config(
+                {
+                    "BLOCK_M": config.kwargs["BLOCK_M"], "BLOCK_N": config.kwargs["BLOCK_N"]
+                },
+                num_stages=0, #2, #config.num_stages,
+                num_warps=4, #config.num_warps,
+                num_buffers_warp_spec=2, # 2,3,4
+                num_consumer_groups=2,
+                reg_dec_producer=24, reg_inc_consumer=240 # 40, 232
+            )
+        )
+    return configs
+
+
+def _get_fw_configs_Tma():
+    configs = []
+    for config in _get_best_config(): #_get_fw_configs(): or _get_best_config():
+        for buffers in [2]: #, 3, 4]:
+            for dec, inc in [(24, 240)]: #, (40, 232)]:
+                configs.append(
+                    triton.Config(
+                        {
+                            "BLOCK_M": config.kwargs["BLOCK_M"], "BLOCK_N": config.kwargs["BLOCK_N"]
+                        },
+                        num_stages=0, #config.num_stages,
+                        num_warps=4, #config.num_warps,
+                        num_buffers_warp_spec=buffers, # 2,3,4
+                        num_consumer_groups=2, # 2
+                        reg_dec_producer=dec, reg_inc_consumer=inc # 40, 232
+                    )
+                )
     return configs
 
 
@@ -218,6 +391,10 @@ def _ragged_hstu_attn_fwd_one_block(  # noqa: C901
     q,
     K_block_ptr,
     V_block_ptr,
+    K_desc_ptr,
+    V_desc_ptr,
+    offset_h,
+    seq_start,
     n_targets,
     ts_1_ptrs,
     ts_0,
@@ -245,13 +422,29 @@ def _ragged_hstu_attn_fwd_one_block(  # noqa: C901
     HAS_MAX_ATTN_LEN: tl.constexpr,
     IS_DELTA_Q: tl.constexpr,
     ALLOW_TF32: tl.constexpr,
+    BLOCK_D_Q: tl.constexpr,
+    BLOCK_D_V: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    enable_tma: tl.constexpr,
 ):
     start_n = tl.multiple_of(start_n, BLOCK_N)
     # -- compute qk ----
-    k = tl.load(K_block_ptr, boundary_check=(1,), padding_option="zero")
-    qk = tl.dot(q, k, allow_tf32=ALLOW_TF32) * alpha
+    k = None
+    qk = None
+    if enable_tma:
+        k = tl._experimental_descriptor_load(
+            K_desc_ptr,
+            [(seq_start + start_n).to(tl.int32), offset_h.to(tl.int32)],
+            [BLOCK_N, BLOCK_D_Q],
+            tl.bfloat16,
+        )
+        #k=tl.where(offs_n[:, None] < seq_len, k, 0)
+        # tma can only be loaded in one order, use trans afterwards
+        qk = tl.dot(q, tl.trans(k), allow_tf32=ALLOW_TF32) * alpha
+    else:
+        k = tl.load(K_block_ptr, boundary_check=(1,), padding_option="zero")
+        qk = tl.dot(q, k, allow_tf32=ALLOW_TF32) * alpha
     invalid_mask = offs_m[:, None] == offs_n[None, :]
     if HAS_MULTIPLE_TARGETS:
         if INVALID_MASK_TYPE == "lower_triangular":
@@ -282,7 +475,7 @@ def _ragged_hstu_attn_fwd_one_block(  # noqa: C901
         if INVALID_MASK_TYPE == "lower_triangular":
             invalid_mask = invalid_mask or offs_n_minus_m < 0
         elif INVALID_MASK_TYPE == "upper_triangular":
-            invalid_mask = invalid_mask or offs_n_minus_m > 0    
+            invalid_mask = invalid_mask or offs_n_minus_m > 0
     if ATTN_BIAS_TYPE == "fused":
         attn_bias = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         if USE_TIME_BIAS:
@@ -335,7 +528,18 @@ def _ragged_hstu_attn_fwd_one_block(  # noqa: C901
     silu = tl.where(invalid_mask, silu, 0)
     if HAS_ATTN_SCALE:
         silu = silu * attn_scale[:, None]
-    v = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")
+
+    v = None
+    if enable_tma:
+        v = tl._experimental_descriptor_load(
+            V_desc_ptr,
+            [(seq_start + start_n).to(tl.int32), offset_h.to(tl.int32)],
+            [BLOCK_N, BLOCK_D_V],
+            tl.bfloat16,
+        )
+        #v=tl.where(offs_n[:, None] < seq_len, v, 0)
+    else:
+        v = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")
     silu = silu.to(v.dtype)
     return tl.dot(silu, v, allow_tf32=ALLOW_TF32)
 
@@ -345,6 +549,10 @@ def _ragged_hstu_attn_fwd_compute(  # noqa C901
     Q,
     K,
     V,
+    desc_q,
+    desc_k,
+    desc_v,
+    desc_o,
     seq_offsets,
     TS,
     TW,
@@ -397,6 +605,7 @@ def _ragged_hstu_attn_fwd_compute(  # noqa C901
     BLOCK_N: tl.constexpr,
     max_attn_len: tl.constexpr,
     HAS_MAX_ATTN_LEN: tl.constexpr,
+    enable_tma: tl.constexpr,
 ):
     off_z = off_hz // H
     off_h = off_hz % H
@@ -419,40 +628,45 @@ def _ragged_hstu_attn_fwd_compute(  # noqa C901
         # initialize offsets
         offs_m = start_m + tl.arange(0, BLOCK_M)
         offs_n = tl.arange(0, BLOCK_N)
-        if IS_DELTA_Q:
-            Q_block_ptr = tl.make_block_ptr(
-                base=Q + off_h * stride_qh + off_z * DeltaSize * stride_qm,
-                shape=(DeltaSize, BLOCK_D_Q),
-                strides=(stride_qm, 1),
-                offsets=(start_m_delta, 0),
-                block_shape=(BLOCK_M, BLOCK_D_Q),
+        Q_block_ptr = None
+        if not enable_tma:
+            if IS_DELTA_Q:
+                Q_block_ptr = tl.make_block_ptr(
+                    base=Q + off_h * stride_qh + off_z * DeltaSize * stride_qm,
+                    shape=(DeltaSize, BLOCK_D_Q),
+                    strides=(stride_qm, 1),
+                    offsets=(start_m_delta, 0),
+                    block_shape=(BLOCK_M, BLOCK_D_Q),
+                    order=(1, 0),
+                )
+            else:
+                Q_block_ptr = tl.make_block_ptr(
+                    base=Q + off_h * stride_qh + seq_start * stride_qm,
+                    shape=(seq_len, BLOCK_D_Q),
+                    strides=(stride_qm, 1),
+                    offsets=(start_m, 0),
+                    block_shape=(BLOCK_M, BLOCK_D_Q),
+                    order=(1, 0),
+                )
+        K_block_ptr = None
+        V_block_ptr = None
+        if not enable_tma:
+            K_block_ptr = tl.make_block_ptr(
+                base=K + off_h * stride_kh + seq_start * stride_kn,
+                shape=(BLOCK_D_Q, seq_len),
+                strides=(1, stride_kn),
+                offsets=(0, 0),
+                block_shape=(BLOCK_D_Q, BLOCK_N),
+                order=(0, 1),
+            )
+            V_block_ptr = tl.make_block_ptr(
+                base=V + off_h * stride_vh + seq_start * stride_vn,
+                shape=(seq_len, BLOCK_D_V),
+                strides=(stride_vn, 1),
+                offsets=(0, 0),
+                block_shape=(BLOCK_N, BLOCK_D_V),
                 order=(1, 0),
             )
-        else:
-            Q_block_ptr = tl.make_block_ptr(
-                base=Q + off_h * stride_qh + seq_start * stride_qm,
-                shape=(seq_len, BLOCK_D_Q),
-                strides=(stride_qm, 1),
-                offsets=(start_m, 0),
-                block_shape=(BLOCK_M, BLOCK_D_Q),
-                order=(1, 0),
-            )
-        K_block_ptr = tl.make_block_ptr(
-            base=K + off_h * stride_kh + seq_start * stride_kn,
-            shape=(BLOCK_D_Q, seq_len),
-            strides=(1, stride_kn),
-            offsets=(0, 0),
-            block_shape=(BLOCK_D_Q, BLOCK_N),
-            order=(0, 1),
-        )
-        V_block_ptr = tl.make_block_ptr(
-            base=V + off_h * stride_vh + seq_start * stride_vn,
-            shape=(seq_len, BLOCK_D_V),
-            strides=(stride_vn, 1),
-            offsets=(0, 0),
-            block_shape=(BLOCK_N, BLOCK_D_V),
-            order=(1, 0),
-        )
         mask_m = offs_m < seq_len
         if ATTN_BIAS_TYPE == "fused" and USE_TIME_BIAS:
             ts_0_ptrs = TS + off_z * stride_ts + offs_m
@@ -471,7 +685,16 @@ def _ragged_hstu_attn_fwd_compute(  # noqa C901
             scale_ptrs = Scale + off_z * stride_sz
             attn_scale = tl.load(scale_ptrs + offs_m * stride_sm, mask=offs_m < seq_len)
 
-        q = tl.load(Q_block_ptr, boundary_check=(0,), padding_option="zero")
+        if enable_tma: # TODO: IS_DELTA_Q
+            q = tl._experimental_descriptor_load(
+                desc_q,
+                [(seq_start + start_m).to(tl.int32), (off_h * stride_qh).to(tl.int32)],
+                [BLOCK_M, BLOCK_D_Q],
+                tl.bfloat16,
+            )
+            #q=tl.where(offs_m[:, None] < seq_len, q, 0)
+        else:
+            q = tl.load(Q_block_ptr, boundary_check=(0,), padding_option="zero")
         acc = tl.zeros([BLOCK_M, BLOCK_D_V], dtype=tl.float32)
         if INVALID_MASK_TYPE == "lower_triangular":
             if HAS_MULTIPLE_TARGETS:
@@ -497,11 +720,12 @@ def _ragged_hstu_attn_fwd_compute(  # noqa C901
             low = start_m
             high = seq_len
         # pyre-ignore[61]
-        if low > 0:
-            # pyre-ignore[61]
-            K_block_ptr = tl.advance(K_block_ptr, (0, low))
-            # pyre-ignore[61]
-            V_block_ptr = tl.advance(V_block_ptr, (low, 0))
+        if not enable_tma:
+            if low > 0:
+                # pyre-ignore[61]
+                K_block_ptr = tl.advance(K_block_ptr, (0, low))
+                # pyre-ignore[61]
+                V_block_ptr = tl.advance(V_block_ptr, (low, 0))
         # pyre-ignore[61]
         for start_n in range(low, high, BLOCK_N):
             cur_offs_n = offs_n + start_n
@@ -516,6 +740,10 @@ def _ragged_hstu_attn_fwd_compute(  # noqa C901
                 q=q,
                 K_block_ptr=K_block_ptr,
                 V_block_ptr=V_block_ptr,
+                K_desc_ptr=desc_k,
+                V_desc_ptr=desc_v,
+                offset_h=off_h * stride_vh,
+                seq_start=seq_start,
                 n_targets=n_targets if HAS_MULTIPLE_TARGETS else None,
                 ts_1_ptrs=(
                     # pyre-ignore[61]
@@ -551,21 +779,26 @@ def _ragged_hstu_attn_fwd_compute(  # noqa C901
                 HAS_MAX_ATTN_LEN=HAS_MAX_ATTN_LEN,
                 IS_DELTA_Q=IS_DELTA_Q,
                 ALLOW_TF32=ALLOW_TF32,
+                BLOCK_D_Q=BLOCK_D_Q,
+                BLOCK_D_V=BLOCK_D_V,
                 BLOCK_M=BLOCK_M,
                 BLOCK_N=BLOCK_N,
+                enable_tma=enable_tma,
             )
-            K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
-            V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
+            if not enable_tma:
+                K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
+                V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
 
         if HAS_MULTIPLE_TARGETS and INVALID_MASK_TYPE == "lower_triangular":
             # pyre-ignore[61]
             if uih_end < start_m:
                 low_delta = start_m
                 high_delta = start_m + BLOCK_M
-                offset = (low_delta - uih_end).to(tl.int32)  # pyre-ignore [61]
-                K_block_ptr = tl.advance(K_block_ptr, (0, offset))
-                V_block_ptr = tl.advance(V_block_ptr, (offset, 0))
-                for start_delta in range(low_delta, high_delta, BLOCK_N):
+                if not enable_tma:
+                    offset = (low_delta - uih_end).to(tl.int32)  # pyre-ignore [61]
+                    K_block_ptr = tl.advance(K_block_ptr, (0, offset))
+                    V_block_ptr = tl.advance(V_block_ptr, (offset, 0))
+                for start_delta in tl.range(low_delta, high_delta, BLOCK_N):#, num_stages=0):
                     cur_offs_n = offs_n + start_delta
                     mask_n = cur_offs_n < seq_len
                     acc += _ragged_hstu_attn_fwd_one_block(
@@ -578,6 +811,10 @@ def _ragged_hstu_attn_fwd_compute(  # noqa C901
                         q=q,
                         K_block_ptr=K_block_ptr,
                         V_block_ptr=V_block_ptr,
+                        K_desc_ptr=desc_k,
+                        V_desc_ptr=desc_v,
+                        offset_h=off_h * stride_vh,
+                        seq_start=seq_start,
                         n_targets=n_targets if HAS_MULTIPLE_TARGETS else None,
                         ts_1_ptrs=(
                             # pyre-ignore[61]
@@ -617,38 +854,50 @@ def _ragged_hstu_attn_fwd_compute(  # noqa C901
                         HAS_MAX_ATTN_LEN=HAS_MAX_ATTN_LEN,
                         IS_DELTA_Q=IS_DELTA_Q,
                         ALLOW_TF32=ALLOW_TF32,
+                        BLOCK_D_Q=BLOCK_D_Q,
+                        BLOCK_D_V=BLOCK_D_V,
                         BLOCK_M=BLOCK_M,
                         BLOCK_N=BLOCK_N,
+                        enable_tma=enable_tma,
                     )
-                    K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
-                    V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
+                    if not enable_tma:
+                        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
+                        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
 
-        if IS_DELTA_Q:
-            start_m_delta = pid * BLOCK_M
-            offs_m_delta = start_m_delta + tl.arange(0, BLOCK_M)
-            offs_v_d = tl.arange(0, BLOCK_D_V)
-            off_o = (
-                (off_z * DeltaSize + offs_m_delta[:, None]) * stride_om
-                + off_h * stride_oh
-                + offs_v_d[None, :]
+        if not enable_tma:
+            if IS_DELTA_Q:
+                start_m_delta = pid * BLOCK_M
+                offs_m_delta = start_m_delta + tl.arange(0, BLOCK_M)
+                offs_v_d = tl.arange(0, BLOCK_D_V)
+                off_o = (
+                    (off_z * DeltaSize + offs_m_delta[:, None]) * stride_om
+                    + off_h * stride_oh
+                    + offs_v_d[None, :]
+                )
+                out_ptrs = Out + off_o
+                tl.store(out_ptrs, acc, mask=(offs_m_delta < DeltaSize)[:, None])
+            else:
+                # rematerialize offsets to save registers
+                start_m = pid * BLOCK_M
+                offs_m = start_m + tl.arange(0, BLOCK_M)
+                offs_v_d = tl.arange(0, BLOCK_D_V)
+                off_o = (
+                    (seq_start + offs_m[:, None]) * stride_om
+                    + off_h * stride_oh
+                    + offs_v_d[None, :]
+                )
+                out_ptrs = Out + off_o
+                tl.store(out_ptrs, acc, mask=(offs_m < seq_len)[:, None])
+        else: # TODO: IS_DELTA_Q
+            # do we need boundary check for store?
+            tl._experimental_descriptor_store(
+                desc_o,
+                acc,
+                [(seq_start + pid * BLOCK_M).to(tl.int32), (off_h * stride_oh).to(tl.int32)],
             )
-            out_ptrs = Out + off_o
-            tl.store(out_ptrs, acc, mask=(offs_m_delta < DeltaSize)[:, None])
-        else:
-            # rematerialize offsets to save registers
-            start_m = pid * BLOCK_M
-            offs_m = start_m + tl.arange(0, BLOCK_M)
-            offs_v_d = tl.arange(0, BLOCK_D_V)
-            off_o = (
-                (seq_start + offs_m[:, None]) * stride_om
-                + off_h * stride_oh
-                + offs_v_d[None, :]
-            )
-            out_ptrs = Out + off_o
-            tl.store(out_ptrs, acc, mask=(offs_m < seq_len)[:, None])
 
 @triton.autotune(
-    configs=_get_fw_configs(),
+    configs=_get_fw_configs_noWS(),
     key=[
         "Z",
         "H",
@@ -666,6 +915,10 @@ def _ragged_hstu_attn_fwd(  # noqa C901
     Q,
     K,
     V,
+    desc_q,
+    desc_k,
+    desc_v,
+    desc_o,
     seq_offsets,
     TS,
     TW,
@@ -716,6 +969,7 @@ def _ragged_hstu_attn_fwd(  # noqa C901
     BLOCK_N: tl.constexpr,
     max_attn_len: tl.constexpr,
     HAS_MAX_ATTN_LEN: tl.constexpr,
+    enable_tma: tl.constexpr,
 ):
     off_hz = tl.program_id(1)
     pid = tl.program_id(0)
@@ -723,6 +977,10 @@ def _ragged_hstu_attn_fwd(  # noqa C901
         Q=Q,
         K=K,
         V=V,
+        desc_q=desc_q,
+        desc_k=desc_k,
+        desc_v=desc_v,
+        desc_o=desc_o,
         seq_offsets=seq_offsets,
         TS=TS,
         TW=TW,
@@ -775,11 +1033,294 @@ def _ragged_hstu_attn_fwd(  # noqa C901
         HAS_MAX_ATTN_LEN=HAS_MAX_ATTN_LEN,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
+        enable_tma=enable_tma,
     )
 
 
 @triton.autotune(
-    configs=_get_fw_configs(),
+    configs=_get_fw_configs_WS(),
+    key=[
+        "Z",
+        "H",
+        "MAX_SEQ_LEN",
+        "DimQ",
+        "DimV",
+        "BUCKET_FN",
+        "ATTN_BIAS_TYPE",
+        "DeltaSize",
+        "IS_DELTA_Q",
+    ],
+)
+@triton.jit
+def _ragged_hstu_attn_fwd_ws(  # noqa C901
+    Q,
+    K,
+    V,
+    desc_q,
+    desc_k,
+    desc_v,
+    desc_o,
+    seq_offsets,
+    TS,
+    TW,
+    PW,
+    Bias,
+    seq2_offsets,
+    delta_x_offsets,
+    num_targets,
+    Scale,
+    Out,
+    stride_qm,
+    stride_qh,
+    stride_kn,
+    stride_kh,
+    stride_vn,
+    stride_vh,
+    stride_sz,
+    stride_sm,
+    stride_ts,
+    stride_om,
+    stride_oh,
+    alpha,
+    Z,
+    H,
+    MAX_SEQ_LEN,
+    DimQ,
+    DimV,
+    DeltaSize,
+    num_buckets,
+    max_pos_ind,
+    time_bucket_incr,
+    time_bucket_div,
+    time_delta,
+    INVALID_MASK_TYPE: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    BUCKET_FN: tl.constexpr,
+    ATTN_BIAS_TYPE: tl.constexpr,
+    USE_TIME_BIAS: tl.constexpr,
+    USE_POS_BIAS: tl.constexpr,
+    HAS_MAX_POS_IND: tl.constexpr,
+    HAS_MULTIPLE_TARGETS: tl.constexpr,
+    HAS_ATTN_SCALE: tl.constexpr,
+    IS_DELTA_Q: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
+    BLOCK_D_Q: tl.constexpr,
+    BLOCK_D_V: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    max_attn_len: tl.constexpr,
+    HAS_MAX_ATTN_LEN: tl.constexpr,
+    enable_tma: tl.constexpr,
+):
+    off_hz = tl.program_id(1)
+    pid = tl.program_id(0)
+    _ragged_hstu_attn_fwd_compute(
+        Q=Q,
+        K=K,
+        V=V,
+        desc_q=desc_q,
+        desc_k=desc_k,
+        desc_v=desc_v,
+        desc_o=desc_o,
+        seq_offsets=seq_offsets,
+        TS=TS,
+        TW=TW,
+        PW=PW,
+        Bias=Bias,
+        seq2_offsets=seq2_offsets,
+        delta_x_offsets=delta_x_offsets,
+        num_targets=num_targets,
+        Scale=Scale,
+        Out=Out,
+        stride_qm=stride_qm,
+        stride_qh=stride_qh,
+        stride_kn=stride_kn,
+        stride_kh=stride_kh,
+        stride_vn=stride_vn,
+        stride_vh=stride_vh,
+        stride_sz=stride_sz,
+        stride_sm=stride_sm,
+        stride_ts=stride_ts,
+        stride_om=stride_om,
+        stride_oh=stride_oh,
+        alpha=alpha,
+        Z=Z,
+        H=H,
+        MAX_SEQ_LEN=MAX_SEQ_LEN,
+        DimQ=DimQ,
+        DimV=DimV,
+        DeltaSize=DeltaSize,
+        num_buckets=num_buckets,
+        max_pos_ind=max_pos_ind,
+        time_bucket_incr=time_bucket_incr,
+        time_bucket_div=time_bucket_div,
+        time_delta=time_delta,
+        off_hz=off_hz,
+        pid=pid,
+        INVALID_MASK_TYPE=INVALID_MASK_TYPE,
+        CAUSAL=CAUSAL,
+        BUCKET_FN=BUCKET_FN,
+        ATTN_BIAS_TYPE=ATTN_BIAS_TYPE,
+        USE_TIME_BIAS=USE_TIME_BIAS,
+        USE_POS_BIAS=USE_POS_BIAS,
+        HAS_MAX_POS_IND=HAS_MAX_POS_IND,
+        HAS_MULTIPLE_TARGETS=HAS_MULTIPLE_TARGETS,
+        HAS_ATTN_SCALE=HAS_ATTN_SCALE,
+        IS_DELTA_Q=IS_DELTA_Q,
+        ALLOW_TF32=ALLOW_TF32,
+        BLOCK_D_Q=BLOCK_D_Q,
+        BLOCK_D_V=BLOCK_D_V,
+        max_attn_len=max_attn_len,
+        HAS_MAX_ATTN_LEN=HAS_MAX_ATTN_LEN,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        enable_tma=enable_tma,
+    )
+
+
+@triton.autotune(
+    configs=_get_fw_configs_Tma(),
+    key=[
+        "Z",
+        "H",
+        "MAX_SEQ_LEN",
+        "DimQ",
+        "DimV",
+        "BUCKET_FN",
+        "ATTN_BIAS_TYPE",
+        "DeltaSize",
+        "IS_DELTA_Q",
+    ],
+)
+@triton.jit
+def _ragged_hstu_attn_fwd_tma(  # noqa C901
+    Q,
+    K,
+    V,
+    desc_q,
+    desc_k,
+    desc_v,
+    desc_o,
+    seq_offsets,
+    TS,
+    TW,
+    PW,
+    Bias,
+    seq2_offsets,
+    delta_x_offsets,
+    num_targets,
+    Scale,
+    Out,
+    stride_qm,
+    stride_qh,
+    stride_kn,
+    stride_kh,
+    stride_vn,
+    stride_vh,
+    stride_sz,
+    stride_sm,
+    stride_ts,
+    stride_om,
+    stride_oh,
+    alpha,
+    Z,
+    H,
+    MAX_SEQ_LEN,
+    DimQ,
+    DimV,
+    DeltaSize,
+    num_buckets,
+    max_pos_ind,
+    time_bucket_incr,
+    time_bucket_div,
+    time_delta,
+    INVALID_MASK_TYPE: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    BUCKET_FN: tl.constexpr,
+    ATTN_BIAS_TYPE: tl.constexpr,
+    USE_TIME_BIAS: tl.constexpr,
+    USE_POS_BIAS: tl.constexpr,
+    HAS_MAX_POS_IND: tl.constexpr,
+    HAS_MULTIPLE_TARGETS: tl.constexpr,
+    HAS_ATTN_SCALE: tl.constexpr,
+    IS_DELTA_Q: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
+    BLOCK_D_Q: tl.constexpr,
+    BLOCK_D_V: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    max_attn_len: tl.constexpr,
+    HAS_MAX_ATTN_LEN: tl.constexpr,
+    enable_tma: tl.constexpr,
+):
+    off_hz = tl.program_id(1)
+    pid = tl.program_id(0)
+    _ragged_hstu_attn_fwd_compute(
+        Q=Q,
+        K=K,
+        V=V,
+        desc_q=desc_q,
+        desc_k=desc_k,
+        desc_v=desc_v,
+        desc_o=desc_o,
+        seq_offsets=seq_offsets,
+        TS=TS,
+        TW=TW,
+        PW=PW,
+        Bias=Bias,
+        seq2_offsets=seq2_offsets,
+        delta_x_offsets=delta_x_offsets,
+        num_targets=num_targets,
+        Scale=Scale,
+        Out=Out,
+        stride_qm=stride_qm,
+        stride_qh=stride_qh,
+        stride_kn=stride_kn,
+        stride_kh=stride_kh,
+        stride_vn=stride_vn,
+        stride_vh=stride_vh,
+        stride_sz=stride_sz,
+        stride_sm=stride_sm,
+        stride_ts=stride_ts,
+        stride_om=stride_om,
+        stride_oh=stride_oh,
+        alpha=alpha,
+        Z=Z,
+        H=H,
+        MAX_SEQ_LEN=MAX_SEQ_LEN,
+        DimQ=DimQ,
+        DimV=DimV,
+        DeltaSize=DeltaSize,
+        num_buckets=num_buckets,
+        max_pos_ind=max_pos_ind,
+        time_bucket_incr=time_bucket_incr,
+        time_bucket_div=time_bucket_div,
+        time_delta=time_delta,
+        off_hz=off_hz,
+        pid=pid,
+        INVALID_MASK_TYPE=INVALID_MASK_TYPE,
+        CAUSAL=CAUSAL,
+        BUCKET_FN=BUCKET_FN,
+        ATTN_BIAS_TYPE=ATTN_BIAS_TYPE,
+        USE_TIME_BIAS=USE_TIME_BIAS,
+        USE_POS_BIAS=USE_POS_BIAS,
+        HAS_MAX_POS_IND=HAS_MAX_POS_IND,
+        HAS_MULTIPLE_TARGETS=HAS_MULTIPLE_TARGETS,
+        HAS_ATTN_SCALE=HAS_ATTN_SCALE,
+        IS_DELTA_Q=IS_DELTA_Q,
+        ALLOW_TF32=ALLOW_TF32,
+        BLOCK_D_Q=BLOCK_D_Q,
+        BLOCK_D_V=BLOCK_D_V,
+        max_attn_len=max_attn_len,
+        HAS_MAX_ATTN_LEN=HAS_MAX_ATTN_LEN,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        enable_tma=enable_tma,
+    )
+
+
+@triton.autotune(
+    configs=_get_fw_configs_noWS(),
     key=[
         "Z",
         "H",
@@ -847,6 +1388,7 @@ def _ragged_hstu_attn_fwd_persistent(  # noqa C901
     BLOCK_N: tl.constexpr,
     max_attn_len: tl.constexpr,
     HAS_MAX_ATTN_LEN: tl.constexpr,
+    enable_tma: tl.constexpr,
 ):
     n_tile_num = tl.cdiv(MAX_SEQ_LEN, BLOCK_M)
     prog_id = tl.program_id(0)
@@ -862,7 +1404,7 @@ def _ragged_hstu_attn_fwd_persistent(  # noqa C901
     for _ in range(0, tiles_per_sm):
         pid = (total_tiles - tile_idx - 1) // (Z * H)
         off_hz = (total_tiles - tile_idx - 1) % (Z * H)
-        ## 
+        ##
         _ragged_hstu_attn_fwd_compute(
             Q=Q,
             K=K,
@@ -919,6 +1461,7 @@ def _ragged_hstu_attn_fwd_persistent(  # noqa C901
             HAS_MAX_ATTN_LEN=HAS_MAX_ATTN_LEN,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
+            enable_tma=enable_tma,
         )
         tile_idx += num_progs
 
@@ -950,6 +1493,69 @@ def triton_ragged_attention(
     has_attn_scale = attn_scale is not None
     has_max_attn_len = max_attn_len is not None
 
+    # set up descriptors for TMA
+    TMA_SIZE = 128
+    BLOCK_D_V, BLOCK_D_Q = DimV, DimQ
+    desc_helper = TmaAutoTuneHelper()
+    desc_helper.init_tma_descriptor("k")
+    desc_helper.init_tma_descriptor("v")
+    desc_helper.init_tma_descriptor("q")
+    desc_helper.init_tma_descriptor("o")
+    enable_tma = False
+
+    def grid_tma(META):
+        if enable_tma == False:
+            return lambda meta: (  # noqa E731
+                triton.cdiv(N, meta["BLOCK_M"]),
+                Z * H,
+            )
+
+        nonlocal desc_helper
+        desc_helper.fill_2d_tma_descriptor(
+            "k",
+            k.data_ptr(),
+            L, H * DimQ,
+            META["BLOCK_N"],
+            BLOCK_D_Q,
+            k.element_size(),
+        )
+        desc_helper.fill_2d_tma_descriptor(
+            "v",
+            v.data_ptr(),
+            L, H * DimV,
+            META["BLOCK_N"],
+            BLOCK_D_V,
+            v.element_size(),
+        )
+        desc_helper.fill_2d_tma_descriptor(
+            "q",
+            q.data_ptr(),
+            BATCH * H * N_CTX,
+            HEAD_DIM_Q,
+            META["BLOCK_M"],
+            HEAD_DIM_Q,
+            q.element_size(),
+        )
+        desc_helper.fill_2d_tma_descriptor(
+            "o",
+            o.data_ptr(),
+            BATCH * H * N_CTX,
+            HEAD_DIM_Q,
+            META["BLOCK_M"],
+            HEAD_DIM_Q,
+            o.element_size(),
+        )
+        return (
+            triton.cdiv(q.shape[2], META["BLOCK_M"]),
+            q.shape[0] * q.shape[1],
+            1,
+        )
+
+    desc_q = desc_helper.get_tma_descriptor_kernel_param("q")
+    desc_k = desc_helper.get_tma_descriptor_kernel_param("k")
+    desc_v = desc_helper.get_tma_descriptor_kernel_param("v")
+    desc_o = desc_helper.get_tma_descriptor_kernel_param("o")
+
     stride_sz = 0
     stride_sm = 0
     if attn_scale is not None:
@@ -963,6 +1569,10 @@ def triton_ragged_attention(
     "Q": q,
     "K": k,
     "V": v,
+    "desc_q": desc_q,
+    "desc_k": desc_k,
+    "desc_v": desc_v,
+    "desc_o": desc_o,
     "seq_offsets": seq_offsets,
     "TS": None,
     "TW": None,
@@ -1010,17 +1620,19 @@ def triton_ragged_attention(
     "BLOCK_D_Q": DimQ,
     "BLOCK_D_V": DimV,
     "max_attn_len": max_attn_len,
-    "HAS_MAX_ATTN_LEN": has_max_attn_len
+    "HAS_MAX_ATTN_LEN": has_max_attn_len,
+    "enable_tma": enable_tma
     }
+
     if torch.version.hip:
         grid = (1216,)
         _ragged_hstu_attn_fwd_persistent[grid](**kwargs)
     else:
-        grid = lambda meta: (  # noqa E731
-                triton.cdiv(N, meta["BLOCK_M"]),
-                Z * H,
-            )
-        _ragged_hstu_attn_fwd[grid](**kwargs)
+        #grid = lambda meta: (  # noqa E731
+        #        triton.cdiv(N, meta["BLOCK_M"]),
+        #        Z * H,
+        #    )
+        _ragged_hstu_attn_fwd[grid_tma](**kwargs)
     return out
 
 
@@ -1117,7 +1729,8 @@ def triton_ragged_attention_relative_bias(
     "BLOCK_D_Q": DimQ,
     "BLOCK_D_V": DimV,
     "max_attn_len": max_attn_len,
-    "HAS_MAX_ATTN_LEN": has_max_attn_len
+    "HAS_MAX_ATTN_LEN": has_max_attn_len,
+    "enable_tma": False
     }
     if torch.version.hip:
         grid = (1216,)
