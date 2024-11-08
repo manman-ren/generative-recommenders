@@ -949,6 +949,7 @@ def _ragged_hstu_attn_fwd(  # noqa C901
     Z,
     H,
     MAX_SEQ_LEN,
+    AUTOTUNE_MAX_SEQ_LEN,  # Quantized MAX_SEQ_LEN used as an autotuning key
     DimQ,
     DimV,
     DeltaSize,
@@ -1047,7 +1048,7 @@ def _ragged_hstu_attn_fwd(  # noqa C901
     key=[
         "Z",
         "H",
-        "MAX_SEQ_LEN",
+        "AUTOTUNE_MAX_SEQ_LEN",
         "DimQ",
         "DimV",
         "BUCKET_FN",
@@ -1090,6 +1091,7 @@ def _ragged_hstu_attn_fwd_ws(  # noqa C901
     Z,
     H,
     MAX_SEQ_LEN,
+    AUTOTUNE_MAX_SEQ_LEN,  # Quantized MAX_SEQ_LEN used as an autotuning key
     DimQ,
     DimV,
     DeltaSize,
@@ -1188,7 +1190,7 @@ def _ragged_hstu_attn_fwd_ws(  # noqa C901
     key=[
         "Z",
         "H",
-        "MAX_SEQ_LEN",
+        "AUTOTUNE_MAX_SEQ_LEN",
         "DimQ",
         "DimV",
         "BUCKET_FN",
