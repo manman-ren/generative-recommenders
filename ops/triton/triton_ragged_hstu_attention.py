@@ -433,115 +433,122 @@ def _ragged_hstu_attn_fwd_one_block(  # noqa: C901
     k = None
     qk = None
     if enable_tma:
-        k = tl._experimental_descriptor_load(
-            K_desc_ptr,
-            [(seq_start + start_n).to(tl.int32), offset_h.to(tl.int32)],
-            [BLOCK_N, BLOCK_D_Q],
-            tl.bfloat16,
-        )
+        with tl.async_task([0]):
+            k = tl._experimental_descriptor_load(
+                K_desc_ptr,
+                [(seq_start + start_n).to(tl.int32), offset_h.to(tl.int32)],
+                [BLOCK_N, BLOCK_D_Q],
+                tl.bfloat16,
+            )
         #k=tl.where(offs_n[:, None] < seq_len, k, 0)
         # tma can only be loaded in one order, use trans afterwards
-        qk = tl.dot(q, tl.trans(k), allow_tf32=ALLOW_TF32) * alpha
+        with tl.async_task([1, 2]):
+            qk = tl.dot(q, tl.trans(k), allow_tf32=ALLOW_TF32) * alpha
     else:
-        k = tl.load(K_block_ptr, boundary_check=(1,), padding_option="zero")
-        qk = tl.dot(q, k, allow_tf32=ALLOW_TF32) * alpha
-    invalid_mask = offs_m[:, None] == offs_n[None, :]
-    if HAS_MULTIPLE_TARGETS:
-        if INVALID_MASK_TYPE == "lower_triangular":
-            offs_m = tl.where(
-                offs_m < seq_len - n_targets,
-                offs_m,
-                seq_len - n_targets,
-            )
-            offs_n = tl.where(
-                offs_n < seq_len - n_targets,
-                offs_n,
-                seq_len - n_targets,
-            )
-        elif INVALID_MASK_TYPE == "upper_triangular":
-            offs_m = tl.where(offs_m > n_targets - 1, offs_m, n_targets - 1)
-            offs_n = tl.where(offs_n > n_targets - 1, offs_n, n_targets - 1)
-    offs_n_minus_m = offs_n[None, :] - offs_m[:, None]
-    if HAS_MAX_ATTN_LEN:
-        if INVALID_MASK_TYPE == "lower_triangular":
-            invalid_mask = invalid_mask or (
-                offs_n_minus_m < 0 and offs_n_minus_m >= -max_attn_len
-            )
-        elif INVALID_MASK_TYPE == "upper_triangular":
-            invalid_mask = invalid_mask or (
-                offs_n_minus_m > 0 and offs_n_minus_m <= max_attn_len
-            )
-    else:
-        if INVALID_MASK_TYPE == "lower_triangular":
-            invalid_mask = invalid_mask or offs_n_minus_m < 0
-        elif INVALID_MASK_TYPE == "upper_triangular":
-            invalid_mask = invalid_mask or offs_n_minus_m > 0
-    if ATTN_BIAS_TYPE == "fused":
-        attn_bias = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        if USE_TIME_BIAS:
-            if CAUSAL:
-                ts_1 = tl.load(ts_1_ptrs + start_n, mask=mask_n)
-            else:
-                ts_1 = tl.load(ts_1_ptrs + start_n + 1, mask=mask_n)
-            ts = ts_0[:, None] - ts_1[None, :]
-            ts = ts + time_delta
-            ts = tl.where(ts > 1e-6, ts, 1e-6)
-            ts = ts * (1.0 / time_bucket_incr)
-            if BUCKET_FN == "log":
-                ts = tl.log(ts)
-            elif BUCKET_FN == "sqrt":
-                ts = tl.sqrt(ts)
-            ts = ts * (1.0 / time_bucket_div)
-            ts = ts.to(tl.int32)
-            ts = tl.where(ts > 0, ts, 0)
-            ts = tl.where(ts < num_buckets, ts, num_buckets)
-            ts_w = tl.load(
-                TW + ts,
-                mask=mask_m[:, None] and mask_n[None, :],
-            )
-            attn_bias = attn_bias + ts_w
-        if USE_POS_BIAS:
-            if HAS_MAX_POS_IND:
-                offs_pos_w = offs_n_minus_m + max_pos_ind - 1
-                offs_pos_w = tl.where(offs_pos_w > 0, offs_pos_w, 0)
-                offs_pos_w = tl.where(
-                    offs_pos_w < 2 * max_pos_ind - 2,
-                    offs_pos_w,
-                    2 * max_pos_ind - 2,
+        with tl.async_task([0]):
+            k = tl.load(K_block_ptr, boundary_check=(1,), padding_option="zero")
+        with tl.async_task([1, 2]):
+            qk = tl.dot(q, k, allow_tf32=ALLOW_TF32) * alpha
+    with tl.async_task([1, 2]):
+        invalid_mask = offs_m[:, None] == offs_n[None, :]
+        if HAS_MULTIPLE_TARGETS:
+            if INVALID_MASK_TYPE == "lower_triangular":
+                offs_m = tl.where(
+                    offs_m < seq_len - n_targets,
+                    offs_m,
+                    seq_len - n_targets,
                 )
-            else:
-                offs_pos_w = offs_n_minus_m + MAX_SEQ_LEN - 1
-            pos_w = tl.load(
-                PW + offs_pos_w,
-                mask=mask_m[:, None] and mask_n[None, :],
+                offs_n = tl.where(
+                    offs_n < seq_len - n_targets,
+                    offs_n,
+                    seq_len - n_targets,
+                )
+            elif INVALID_MASK_TYPE == "upper_triangular":
+                offs_m = tl.where(offs_m > n_targets - 1, offs_m, n_targets - 1)
+                offs_n = tl.where(offs_n > n_targets - 1, offs_n, n_targets - 1)
+        offs_n_minus_m = offs_n[None, :] - offs_m[:, None]
+        if HAS_MAX_ATTN_LEN:
+            if INVALID_MASK_TYPE == "lower_triangular":
+                invalid_mask = invalid_mask or (
+                    offs_n_minus_m < 0 and offs_n_minus_m >= -max_attn_len
+                )
+            elif INVALID_MASK_TYPE == "upper_triangular":
+                invalid_mask = invalid_mask or (
+                    offs_n_minus_m > 0 and offs_n_minus_m <= max_attn_len
+                )
+        else:
+            if INVALID_MASK_TYPE == "lower_triangular":
+                invalid_mask = invalid_mask or offs_n_minus_m < 0
+            elif INVALID_MASK_TYPE == "upper_triangular":
+                invalid_mask = invalid_mask or offs_n_minus_m > 0
+        if ATTN_BIAS_TYPE == "fused":
+            attn_bias = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+            if USE_TIME_BIAS:
+                if CAUSAL:
+                    ts_1 = tl.load(ts_1_ptrs + start_n, mask=mask_n)
+                else:
+                    ts_1 = tl.load(ts_1_ptrs + start_n + 1, mask=mask_n)
+                ts = ts_0[:, None] - ts_1[None, :]
+                ts = ts + time_delta
+                ts = tl.where(ts > 1e-6, ts, 1e-6)
+                ts = ts * (1.0 / time_bucket_incr)
+                if BUCKET_FN == "log":
+                    ts = tl.log(ts)
+                elif BUCKET_FN == "sqrt":
+                    ts = tl.sqrt(ts)
+                ts = ts * (1.0 / time_bucket_div)
+                ts = ts.to(tl.int32)
+                ts = tl.where(ts > 0, ts, 0)
+                ts = tl.where(ts < num_buckets, ts, num_buckets)
+                ts_w = tl.load(
+                    TW + ts,
+                    mask=mask_m[:, None] and mask_n[None, :],
+                )
+                attn_bias = attn_bias + ts_w
+            if USE_POS_BIAS:
+                if HAS_MAX_POS_IND:
+                    offs_pos_w = offs_n_minus_m + max_pos_ind - 1
+                    offs_pos_w = tl.where(offs_pos_w > 0, offs_pos_w, 0)
+                    offs_pos_w = tl.where(
+                        offs_pos_w < 2 * max_pos_ind - 2,
+                        offs_pos_w,
+                        2 * max_pos_ind - 2,
+                    )
+                else:
+                    offs_pos_w = offs_n_minus_m + MAX_SEQ_LEN - 1
+                pos_w = tl.load(
+                    PW + offs_pos_w,
+                    mask=mask_m[:, None] and mask_n[None, :],
+                )
+                attn_bias = attn_bias + pos_w
+            qk = qk + attn_bias
+        elif ATTN_BIAS_TYPE == "separate":
+            attn_bias = tl.load(
+                bias_ptrs + start_n,
+                mask=mask_m[:, None] & mask_n[None, :],
+                other=0.0,
             )
-            attn_bias = attn_bias + pos_w
-        qk = qk + attn_bias
-    elif ATTN_BIAS_TYPE == "separate":
-        attn_bias = tl.load(
-            bias_ptrs + start_n,
-            mask=mask_m[:, None] & mask_n[None, :],
-            other=0.0,
-        )
-        qk = qk + attn_bias
-    silu = fast_dividef(qk, 1.0 + tl.exp(-qk)) * (1.0 / MAX_SEQ_LEN)
-    silu = tl.where(invalid_mask, silu, 0)
-    if HAS_ATTN_SCALE:
-        silu = silu * attn_scale[:, None]
+            qk = qk + attn_bias
+        silu = fast_dividef(qk, 1.0 + tl.exp(-qk)) * (1.0 / MAX_SEQ_LEN)
+        silu = tl.where(invalid_mask, silu, 0)
+        if HAS_ATTN_SCALE:
+            silu = silu * attn_scale[:, None]
 
-    v = None
-    if enable_tma:
-        v = tl._experimental_descriptor_load(
-            V_desc_ptr,
-            [(seq_start + start_n).to(tl.int32), offset_h.to(tl.int32)],
-            [BLOCK_N, BLOCK_D_V],
-            tl.bfloat16,
-        )
-        #v=tl.where(offs_n[:, None] < seq_len, v, 0)
-    else:
-        v = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")
-    silu = silu.to(v.dtype)
-    return tl.dot(silu, v, allow_tf32=ALLOW_TF32)
+    with tl.async_task([0]):
+        v = None
+        if enable_tma:
+            v = tl._experimental_descriptor_load(
+                V_desc_ptr,
+                [(seq_start + start_n).to(tl.int32), offset_h.to(tl.int32)],
+                [BLOCK_N, BLOCK_D_V],
+                tl.bfloat16,
+            )
+            #v=tl.where(offs_n[:, None] < seq_len, v, 0)
+        else:
+            v = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")
+    with tl.async_task([1, 2]):
+        silu = silu.to(v.dtype)
+        return tl.dot(silu, v, allow_tf32=ALLOW_TF32)
 
 
 @triton.jit
@@ -685,16 +692,17 @@ def _ragged_hstu_attn_fwd_compute(  # noqa C901
             scale_ptrs = Scale + off_z * stride_sz
             attn_scale = tl.load(scale_ptrs + offs_m * stride_sm, mask=offs_m < seq_len)
 
-        if enable_tma: # TODO: IS_DELTA_Q
-            q = tl._experimental_descriptor_load(
-                desc_q,
-                [(seq_start + start_m).to(tl.int32), (off_h * stride_qh).to(tl.int32)],
-                [BLOCK_M, BLOCK_D_Q],
-                tl.bfloat16,
-            )
-            #q=tl.where(offs_m[:, None] < seq_len, q, 0)
-        else:
-            q = tl.load(Q_block_ptr, boundary_check=(0,), padding_option="zero")
+        with tl.async_task([0]):
+            if enable_tma: # TODO: IS_DELTA_Q
+                q = tl._experimental_descriptor_load(
+                    desc_q,
+                    [(seq_start + start_m).to(tl.int32), (off_h * stride_qh).to(tl.int32)],
+                    [BLOCK_M, BLOCK_D_Q],
+                    tl.bfloat16,
+                )
+                #q=tl.where(offs_m[:, None] < seq_len, q, 0)
+            else:
+                q = tl.load(Q_block_ptr, boundary_check=(0,), padding_option="zero")
         acc = tl.zeros([BLOCK_M, BLOCK_D_V], dtype=tl.float32)
         if INVALID_MASK_TYPE == "lower_triangular":
             if HAS_MULTIPLE_TARGETS:
@@ -864,37 +872,38 @@ def _ragged_hstu_attn_fwd_compute(  # noqa C901
                         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
                         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
 
-        if not enable_tma:
-            if IS_DELTA_Q:
-                start_m_delta = pid * BLOCK_M
-                offs_m_delta = start_m_delta + tl.arange(0, BLOCK_M)
-                offs_v_d = tl.arange(0, BLOCK_D_V)
-                off_o = (
-                    (off_z * DeltaSize + offs_m_delta[:, None]) * stride_om
-                    + off_h * stride_oh
-                    + offs_v_d[None, :]
+        with tl.async_task([1, 2]):
+            if not enable_tma:
+                if IS_DELTA_Q:
+                    start_m_delta = pid * BLOCK_M
+                    offs_m_delta = start_m_delta + tl.arange(0, BLOCK_M)
+                    offs_v_d = tl.arange(0, BLOCK_D_V)
+                    off_o = (
+                        (off_z * DeltaSize + offs_m_delta[:, None]) * stride_om
+                        + off_h * stride_oh
+                        + offs_v_d[None, :]
+                    )
+                    out_ptrs = Out + off_o
+                    tl.store(out_ptrs, acc, mask=(offs_m_delta < DeltaSize)[:, None])
+                else:
+                    # rematerialize offsets to save registers
+                    start_m = pid * BLOCK_M
+                    offs_m = start_m + tl.arange(0, BLOCK_M)
+                    offs_v_d = tl.arange(0, BLOCK_D_V)
+                    off_o = (
+                        (seq_start + offs_m[:, None]) * stride_om
+                        + off_h * stride_oh
+                        + offs_v_d[None, :]
+                    )
+                    out_ptrs = Out + off_o
+                    tl.store(out_ptrs, acc, mask=(offs_m < seq_len)[:, None])
+            else: # TODO: IS_DELTA_Q
+                # do we need boundary check for store?
+                tl._experimental_descriptor_store(
+                    desc_o,
+                    acc,
+                    [(seq_start + pid * BLOCK_M).to(tl.int32), (off_h * stride_oh).to(tl.int32)],
                 )
-                out_ptrs = Out + off_o
-                tl.store(out_ptrs, acc, mask=(offs_m_delta < DeltaSize)[:, None])
-            else:
-                # rematerialize offsets to save registers
-                start_m = pid * BLOCK_M
-                offs_m = start_m + tl.arange(0, BLOCK_M)
-                offs_v_d = tl.arange(0, BLOCK_D_V)
-                off_o = (
-                    (seq_start + offs_m[:, None]) * stride_om
-                    + off_h * stride_oh
-                    + offs_v_d[None, :]
-                )
-                out_ptrs = Out + off_o
-                tl.store(out_ptrs, acc, mask=(offs_m < seq_len)[:, None])
-        else: # TODO: IS_DELTA_Q
-            # do we need boundary check for store?
-            tl._experimental_descriptor_store(
-                desc_o,
-                acc,
-                [(seq_start + pid * BLOCK_M).to(tl.int32), (off_h * stride_oh).to(tl.int32)],
-            )
 
 @triton.autotune(
     configs=_get_fw_configs_noWS(),
