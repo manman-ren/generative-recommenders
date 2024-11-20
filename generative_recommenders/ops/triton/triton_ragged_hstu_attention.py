@@ -230,6 +230,52 @@ def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
     return configs
 
 
+def _get_best_config():
+    configs = [
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 128},
+            num_stages=2,
+            num_warps=8,
+        ),
+    ]
+    return configs;
+
+
+def _get_fw_configs_noWS():
+    configs = []
+    for config in _get_best_config(): # _get_best_config(): #_get_fw_configs():
+        configs.append(
+            triton.Config(
+                {
+                    "BLOCK_M": config.kwargs["BLOCK_M"], "BLOCK_N": config.kwargs["BLOCK_N"]
+                },
+                num_stages=config.num_stages,
+                num_warps=config.num_warps,
+                num_buffers_warp_spec=0,
+                num_consumer_groups=0
+            )
+        )
+    return configs
+
+
+def _get_fw_configs_WS():
+    configs = []
+    for config in _get_best_config(): # _get_best_config(): #_get_fw_configs():
+        configs.append(
+            triton.Config(
+                {
+                    "BLOCK_M": config.kwargs["BLOCK_M"], "BLOCK_N": config.kwargs["BLOCK_N"]
+                },
+                num_stages=0, # no need to SWP
+                num_warps=4, # hardcode to 4 for WarpSpec
+                num_buffers_warp_spec=2, # 2,3,4
+                num_consumer_groups=2,
+                reg_dec_producer=24, reg_inc_consumer=240 # 40, 232
+            )
+        )
+    return configs
+
+
 @triton.jit
 def _ragged_hstu_attn_fwd_one_block(  # noqa: C901
     start_n,
@@ -272,103 +318,108 @@ def _ragged_hstu_attn_fwd_one_block(  # noqa: C901
 ):
     start_n = tl.multiple_of(start_n, BLOCK_N)
     # -- compute qk ----
-    k = tl.load(K_block_ptr, boundary_check=(1,), padding_option="zero")
-    qk = tl.dot(q, k, allow_tf32=ALLOW_TF32) * alpha
-    invalid_mask = offs_m[:, None] == offs_n[None, :]
-    if HAS_MULTIPLE_TARGETS:
-        if INVALID_MASK_TYPE == "lower_triangular":
-            offs_m = tl.where(
-                offs_m < seq_len - n_targets,
-                offs_m,
-                seq_len - n_targets,
-            )
-            offs_n = tl.where(
-                offs_n < seq_len - n_targets,
-                offs_n,
-                seq_len - n_targets,
-            )
-        elif INVALID_MASK_TYPE == "upper_triangular":
-            offs_m = tl.where(offs_m > n_targets - 1, offs_m, n_targets - 1)
-            offs_n = tl.where(offs_n > n_targets - 1, offs_n, n_targets - 1)
-    offs_n_minus_m = offs_n[None, :] - offs_m[:, None]
-    if MAX_ATTN_LEN > 0:
-        if INVALID_MASK_TYPE == "lower_triangular":
-            invalid_mask = invalid_mask or (
-                offs_n_minus_m < 0 and offs_n_minus_m >= -MAX_ATTN_LEN
-            )
-        elif INVALID_MASK_TYPE == "upper_triangular":
-            invalid_mask = invalid_mask or (
-                offs_n_minus_m > 0 and offs_n_minus_m <= MAX_ATTN_LEN
-            )
-    else:
-        if INVALID_MASK_TYPE == "lower_triangular":
-            invalid_mask = invalid_mask or offs_n_minus_m < 0
-        elif INVALID_MASK_TYPE == "upper_triangular":
-            invalid_mask = invalid_mask or offs_n_minus_m > 0
-    if HAS_CONTEXTUAL_SEQ_LEN:
-        if INVALID_MASK_TYPE == "lower_triangular":
-            # offs_m[:, None]: [BLOCK_M, BLOCK_N] global row indices shortcut at seq_len - n_targets
-            # offs_n[None, :]: [BLOCK_M, BLOCK_N] global col indices shortcut at seq_len - n_targets
-            row_filter = offs_m < contextual_seq_len
-            if HAS_MULTIPLE_TARGETS:
-                col_filter = offs_n < seq_len - n_targets
-            else:
-                col_filter = offs_n < seq_len
-            invalid_mask = invalid_mask or (row_filter[:, None] and col_filter[None, :])
-    if ATTN_BIAS_TYPE == "fused":
-        attn_bias = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        if USE_TIME_BIAS:
-            if CAUSAL:
-                ts_1 = tl.load(ts_1_ptrs + start_n, mask=mask_n)
-            else:
-                ts_1 = tl.load(ts_1_ptrs + start_n + 1, mask=mask_n)
-            ts = ts_0[:, None] - ts_1[None, :]
-            ts = ts + time_delta
-            ts = tl.where(ts > 1e-6, ts, 1e-6)
-            ts = ts * (1.0 / time_bucket_incr)
-            if BUCKET_FN == "log":
-                ts = tl.log(ts)
-            elif BUCKET_FN == "sqrt":
-                ts = tl.sqrt(ts)
-            ts = ts * (1.0 / time_bucket_div)
-            ts = ts.to(tl.int32)
-            ts = tl.where(ts > 0, ts, 0)
-            ts = tl.where(ts < num_buckets, ts, num_buckets)
-            ts_w = tl.load(
-                TW + ts,
-                mask=mask_m[:, None] and mask_n[None, :],
-            )
-            attn_bias = attn_bias + ts_w
-        if USE_POS_BIAS:
-            if HAS_MAX_POS_IND:
-                offs_pos_w = offs_n_minus_m + max_pos_ind - 1
-                offs_pos_w = tl.where(offs_pos_w > 0, offs_pos_w, 0)
-                offs_pos_w = tl.where(
-                    offs_pos_w < 2 * max_pos_ind - 2,
-                    offs_pos_w,
-                    2 * max_pos_ind - 2,
+    with tl.async_task([0]):
+        k = tl.load(K_block_ptr, boundary_check=(1,), padding_option="zero")
+    with tl.async_task([1, 2]):
+        qk = tl.dot(q, k, allow_tf32=ALLOW_TF32) * alpha
+    with tl.async_task([1, 2]):
+        invalid_mask = offs_m[:, None] == offs_n[None, :]
+        if HAS_MULTIPLE_TARGETS:
+            if INVALID_MASK_TYPE == "lower_triangular":
+                offs_m = tl.where(
+                    offs_m < seq_len - n_targets,
+                    offs_m,
+                    seq_len - n_targets,
                 )
-            else:
-                offs_pos_w = offs_n_minus_m + MAX_SEQ_LEN - 1
-            pos_w = tl.load(
-                PW + offs_pos_w,
-                mask=mask_m[:, None] and mask_n[None, :],
+                offs_n = tl.where(
+                    offs_n < seq_len - n_targets,
+                    offs_n,
+                    seq_len - n_targets,
+                )
+            elif INVALID_MASK_TYPE == "upper_triangular":
+                offs_m = tl.where(offs_m > n_targets - 1, offs_m, n_targets - 1)
+                offs_n = tl.where(offs_n > n_targets - 1, offs_n, n_targets - 1)
+        offs_n_minus_m = offs_n[None, :] - offs_m[:, None]
+        if MAX_ATTN_LEN > 0:
+            if INVALID_MASK_TYPE == "lower_triangular":
+                invalid_mask = invalid_mask or (
+                    offs_n_minus_m < 0 and offs_n_minus_m >= -MAX_ATTN_LEN
+                )
+            elif INVALID_MASK_TYPE == "upper_triangular":
+                invalid_mask = invalid_mask or (
+                    offs_n_minus_m > 0 and offs_n_minus_m <= MAX_ATTN_LEN
+                )
+        else:
+            if INVALID_MASK_TYPE == "lower_triangular":
+                invalid_mask = invalid_mask or offs_n_minus_m < 0
+            elif INVALID_MASK_TYPE == "upper_triangular":
+                invalid_mask = invalid_mask or offs_n_minus_m > 0
+        if HAS_CONTEXTUAL_SEQ_LEN:
+            if INVALID_MASK_TYPE == "lower_triangular":
+                # offs_m[:, None]: [BLOCK_M, BLOCK_N] global row indices shortcut at seq_len - n_targets
+                # offs_n[None, :]: [BLOCK_M, BLOCK_N] global col indices shortcut at seq_len - n_targets
+                row_filter = offs_m < contextual_seq_len
+                if HAS_MULTIPLE_TARGETS:
+                    col_filter = offs_n < seq_len - n_targets
+                else:
+                    col_filter = offs_n < seq_len
+                invalid_mask = invalid_mask or (row_filter[:, None] and col_filter[None, :])
+        if ATTN_BIAS_TYPE == "fused":
+            attn_bias = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+            if USE_TIME_BIAS:
+                if CAUSAL:
+                    ts_1 = tl.load(ts_1_ptrs + start_n, mask=mask_n)
+                else:
+                    ts_1 = tl.load(ts_1_ptrs + start_n + 1, mask=mask_n)
+                ts = ts_0[:, None] - ts_1[None, :]
+                ts = ts + time_delta
+                ts = tl.where(ts > 1e-6, ts, 1e-6)
+                ts = ts * (1.0 / time_bucket_incr)
+                if BUCKET_FN == "log":
+                    ts = tl.log(ts)
+                elif BUCKET_FN == "sqrt":
+                    ts = tl.sqrt(ts)
+                ts = ts * (1.0 / time_bucket_div)
+                ts = ts.to(tl.int32)
+                ts = tl.where(ts > 0, ts, 0)
+                ts = tl.where(ts < num_buckets, ts, num_buckets)
+                ts_w = tl.load(
+                    TW + ts,
+                    mask=mask_m[:, None] and mask_n[None, :],
+                )
+                attn_bias = attn_bias + ts_w
+            if USE_POS_BIAS:
+                if HAS_MAX_POS_IND:
+                    offs_pos_w = offs_n_minus_m + max_pos_ind - 1
+                    offs_pos_w = tl.where(offs_pos_w > 0, offs_pos_w, 0)
+                    offs_pos_w = tl.where(
+                        offs_pos_w < 2 * max_pos_ind - 2,
+                        offs_pos_w,
+                        2 * max_pos_ind - 2,
+                    )
+                else:
+                    offs_pos_w = offs_n_minus_m + MAX_SEQ_LEN - 1
+                pos_w = tl.load(
+                    PW + offs_pos_w,
+                    mask=mask_m[:, None] and mask_n[None, :],
+                )
+                attn_bias = attn_bias + pos_w
+            qk = qk + attn_bias
+        elif ATTN_BIAS_TYPE == "separate":
+            attn_bias = tl.load(
+                bias_ptrs + start_n,
+                mask=mask_m[:, None] & mask_n[None, :],
+                other=0.0,
             )
-            attn_bias = attn_bias + pos_w
-        qk = qk + attn_bias
-    elif ATTN_BIAS_TYPE == "separate":
-        attn_bias = tl.load(
-            bias_ptrs + start_n,
-            mask=mask_m[:, None] & mask_n[None, :],
-            other=0.0,
-        )
-        qk = qk + attn_bias
-    # pyre-fixme[16]: Module `math` has no attribute `fast_dividef`.
-    silu = fast_dividef(qk, 1.0 + tl.exp(-qk)) * (1.0 / MAX_SEQ_LEN)
-    silu = tl.where(invalid_mask, silu, 0)
-    v = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")
-    silu = silu.to(v.dtype)
-    return tl.dot(silu, v, allow_tf32=ALLOW_TF32)
+            qk = qk + attn_bias
+        # pyre-fixme[16]: Module `math` has no attribute `fast_dividef`.
+        silu = fast_dividef(qk, 1.0 + tl.exp(-qk)) * (1.0 / MAX_SEQ_LEN)
+        silu = tl.where(invalid_mask, silu, 0)
+    with tl.async_task([0]):
+        v = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")
+    with tl.async_task([1, 2]):
+        silu = silu.to(v.dtype)
+        return tl.dot(silu, v, allow_tf32=ALLOW_TF32)
 
 
 @triton.jit
@@ -496,7 +547,8 @@ def _ragged_hstu_attn_fwd_compute(  # noqa C901
             off_bias = offs_m[:, None] * seq_len + offs_n[None, :]
             bias_ptrs = Bias + bias_start + off_bias
 
-        q = tl.load(Q_block_ptr, boundary_check=(0,), padding_option="zero")
+        with tl.async_task([0]):
+            q = tl.load(Q_block_ptr, boundary_check=(0,), padding_option="zero")
         acc = tl.zeros([BLOCK_M, BLOCK_D_V], dtype=tl.float32)
         if INVALID_MASK_TYPE == "lower_triangular":
             if HAS_MULTIPLE_TARGETS:
@@ -656,25 +708,26 @@ def _ragged_hstu_attn_fwd_compute(  # noqa C901
                     K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
                     V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
 
-        if IS_DELTA_Q:
-            start_m_delta = pid * BLOCK_M
-            offs_m_delta = start_m_delta + tl.arange(0, BLOCK_M)
-            offs_v_d = tl.arange(0, BLOCK_D_V)
-            off_o = Out + off_z * DeltaSize * stride_om + off_h * stride_oh
-            out_ptrs = off_o + offs_m_delta[:, None] * stride_om + offs_v_d[None, :]
-            tl.store(out_ptrs, acc, mask=(offs_m_delta < DeltaSize)[:, None])
-        else:
-            # rematerialize offsets to save registers
-            start_m = pid * BLOCK_M
-            offs_m = start_m + tl.arange(0, BLOCK_M)
-            offs_v_d = tl.arange(0, BLOCK_D_V)
-            off_o = Out + seq_start * stride_om + off_h * stride_oh
-            out_ptrs = off_o + offs_m[:, None] * stride_om + offs_v_d[None, :]
-            tl.store(out_ptrs, acc, mask=(offs_m < seq_len)[:, None])
+        with tl.async_task([1, 2]):
+            if IS_DELTA_Q:
+                start_m_delta = pid * BLOCK_M
+                offs_m_delta = start_m_delta + tl.arange(0, BLOCK_M)
+                offs_v_d = tl.arange(0, BLOCK_D_V)
+                off_o = Out + off_z * DeltaSize * stride_om + off_h * stride_oh
+                out_ptrs = off_o + offs_m_delta[:, None] * stride_om + offs_v_d[None, :]
+                tl.store(out_ptrs, acc, mask=(offs_m_delta < DeltaSize)[:, None])
+            else:
+                # rematerialize offsets to save registers
+                start_m = pid * BLOCK_M
+                offs_m = start_m + tl.arange(0, BLOCK_M)
+                offs_v_d = tl.arange(0, BLOCK_D_V)
+                off_o = Out + seq_start * stride_om + off_h * stride_oh
+                out_ptrs = off_o + offs_m[:, None] * stride_om + offs_v_d[None, :]
+                tl.store(out_ptrs, acc, mask=(offs_m < seq_len)[:, None])
 
 
 @triton.autotune(
-    configs=_get_fw_configs(),
+    configs=_get_fw_configs_noWS(),
     key=[
         "Z",
         "H",
@@ -689,6 +742,139 @@ def _ragged_hstu_attn_fwd_compute(  # noqa C901
 )
 @triton.jit
 def _ragged_hstu_attn_fwd(  # noqa C901
+    Q,
+    K,
+    V,
+    sort_by_length_indices,
+    seq_offsets,
+    TS,
+    TW,
+    PW,
+    Bias,
+    seq2_offsets,
+    delta_x_offsets,
+    num_targets,
+    Out,
+    stride_qm,
+    stride_qh,
+    stride_kn,
+    stride_kh,
+    stride_vn,
+    stride_vh,
+    stride_ts,
+    stride_om,
+    stride_oh,
+    alpha,
+    Z,
+    H,
+    MAX_SEQ_LEN,
+    AUTOTUNE_MAX_SEQ_LEN,  # Quantized MAX_SEQ_LEN used as an autotuning key
+    DimQ,
+    DimV,
+    DeltaSize,
+    num_buckets,
+    max_pos_ind,
+    time_bucket_incr,
+    time_bucket_div,
+    time_delta,
+    contextual_seq_len,
+    INVALID_MASK_TYPE: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    BUCKET_FN: tl.constexpr,
+    ATTN_BIAS_TYPE: tl.constexpr,
+    USE_TIME_BIAS: tl.constexpr,
+    USE_POS_BIAS: tl.constexpr,
+    HAS_MAX_POS_IND: tl.constexpr,
+    HAS_MULTIPLE_TARGETS: tl.constexpr,
+    IS_DELTA_Q: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
+    BLOCK_D_Q: tl.constexpr,
+    BLOCK_D_V: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    MAX_ATTN_LEN: tl.constexpr,
+    HAS_CONTEXTUAL_SEQ_LEN: tl.constexpr,
+    HAS_SORT_BY_LENGTH_INDICES: tl.constexpr,
+):
+    off_hz = tl.program_id(1)
+    off_z = off_hz // H
+    if HAS_SORT_BY_LENGTH_INDICES:
+        off_z = tl.load(sort_by_length_indices + off_z)
+    off_h = off_hz % H
+    pid = tl.program_id(0)
+    _ragged_hstu_attn_fwd_compute(
+        Q=Q,
+        K=K,
+        V=V,
+        seq_offsets=seq_offsets,
+        TS=TS,
+        TW=TW,
+        PW=PW,
+        Bias=Bias,
+        seq2_offsets=seq2_offsets,
+        delta_x_offsets=delta_x_offsets,
+        num_targets=num_targets,
+        Out=Out,
+        stride_qm=stride_qm,
+        stride_qh=stride_qh,
+        stride_kn=stride_kn,
+        stride_kh=stride_kh,
+        stride_vn=stride_vn,
+        stride_vh=stride_vh,
+        stride_ts=stride_ts,
+        stride_om=stride_om,
+        stride_oh=stride_oh,
+        alpha=alpha,
+        Z=Z,
+        H=H,
+        MAX_SEQ_LEN=MAX_SEQ_LEN,
+        DimQ=DimQ,
+        DimV=DimV,
+        DeltaSize=DeltaSize,
+        num_buckets=num_buckets,
+        max_pos_ind=max_pos_ind,
+        time_bucket_incr=time_bucket_incr,
+        time_bucket_div=time_bucket_div,
+        time_delta=time_delta,
+        contextual_seq_len=contextual_seq_len,
+        off_z=off_z,
+        off_h=off_h,
+        pid=pid,
+        INVALID_MASK_TYPE=INVALID_MASK_TYPE,
+        CAUSAL=CAUSAL,
+        BUCKET_FN=BUCKET_FN,
+        ATTN_BIAS_TYPE=ATTN_BIAS_TYPE,
+        USE_TIME_BIAS=USE_TIME_BIAS,
+        USE_POS_BIAS=USE_POS_BIAS,
+        HAS_MAX_POS_IND=HAS_MAX_POS_IND,
+        HAS_MULTIPLE_TARGETS=HAS_MULTIPLE_TARGETS,
+        IS_DELTA_Q=IS_DELTA_Q,
+        ALLOW_TF32=ALLOW_TF32,
+        BLOCK_D_Q=BLOCK_D_Q,
+        BLOCK_D_V=BLOCK_D_V,
+        MAX_ATTN_LEN=MAX_ATTN_LEN,
+        HAS_CONTEXTUAL_SEQ_LEN=HAS_CONTEXTUAL_SEQ_LEN,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+    )
+
+
+@triton.autotune(
+    configs=_get_fw_configs_WS(),
+    key=[
+        "Z",
+        "H",
+        "AUTOTUNE_MAX_SEQ_LEN",
+        "DimQ",
+        "DimV",
+        "BUCKET_FN",
+        "ATTN_BIAS_TYPE",
+        "DeltaSize",
+        "IS_DELTA_Q",
+    ],
+)
+@triton.jit
+def _ragged_hstu_attn_fwd_ws(  # noqa C901
     Q,
     K,
     V,
@@ -1319,7 +1505,7 @@ _ragged_hstu_attn_fwd = register_tritoncc_specs(
     func=_ragged_hstu_attn_fwd, versioned_specs=_get_named_specs()
 )
 _ragged_hstu_attn_fwd = triton_autotune(
-    configs=_get_fw_configs(),
+    configs=_get_fw_configs_noWS(),
     key=[
         "Z",
         "H",
@@ -2262,6 +2448,7 @@ def triton_ragged_attention_fwd(
     max_attn_len: Optional[int],
     contextual_seq_len: Optional[int],
     sort_by_length_indices: Optional[torch.Tensor],
+    enable_ws: bool,
 ) -> torch.Tensor:
     assert invalid_attn_mask_type in [
         "lower_triangular",
@@ -2287,59 +2474,115 @@ def triton_ragged_attention_fwd(
         Z * H,
     )
 
-    _ragged_hstu_attn_fwd[grid](
-        Q=q,
-        K=k,
-        V=v,
-        sort_by_length_indices=sort_by_length_indices,
-        seq_offsets=seq_offsets,
-        TS=None,
-        TW=None,
-        PW=None,
-        Bias=attn_bias,
-        seq2_offsets=seq2_offsets,
-        delta_x_offsets=None,
-        num_targets=num_targets,
-        Out=out,
-        stride_qm=q.stride(0),
-        stride_qh=q.stride(1),
-        stride_kn=k.stride(0),
-        stride_kh=k.stride(1),
-        stride_vn=v.stride(0),
-        stride_vh=v.stride(1),
-        stride_ts=None,
-        stride_om=out.stride(0),
-        stride_oh=out.stride(1),
-        alpha=alpha,
-        Z=Z,
-        H=H,
-        MAX_SEQ_LEN=N,
-        AUTOTUNE_MAX_SEQ_LEN=autotune_max_seq_len(N),
-        DimQ=DimQ,
-        DimV=DimV,
-        DeltaSize=0,
-        num_buckets=None,
-        max_pos_ind=None,
-        time_bucket_incr=None,
-        time_bucket_div=None,
-        time_delta=None,
-        contextual_seq_len=0 if contextual_seq_len is None else contextual_seq_len,
-        INVALID_MASK_TYPE=invalid_attn_mask_type,
-        CAUSAL=None,
-        BUCKET_FN="none",
-        ATTN_BIAS_TYPE="separate" if has_attn_bias else "none",
-        USE_TIME_BIAS=False,
-        USE_POS_BIAS=False,
-        HAS_MAX_POS_IND=False,
-        HAS_MULTIPLE_TARGETS=has_multiple_targets,
-        IS_DELTA_Q=False,
-        ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
-        BLOCK_D_Q=DimQ,
-        BLOCK_D_V=DimV,
-        MAX_ATTN_LEN=max_attn_len,
-        HAS_CONTEXTUAL_SEQ_LEN=has_contextual_seq_len,
-        HAS_SORT_BY_LENGTH_INDICES=has_sort_by_length_indices,
-    )
+    if enable_ws:
+        _ragged_hstu_attn_fwd_ws[grid](
+            Q=q,
+            K=k,
+            V=v,
+            sort_by_length_indices=sort_by_length_indices,
+            seq_offsets=seq_offsets,
+            TS=None,
+            TW=None,
+            PW=None,
+            Bias=attn_bias,
+            seq2_offsets=seq2_offsets,
+            delta_x_offsets=None,
+            num_targets=num_targets,
+            Out=out,
+            stride_qm=q.stride(0),
+            stride_qh=q.stride(1),
+            stride_kn=k.stride(0),
+            stride_kh=k.stride(1),
+            stride_vn=v.stride(0),
+            stride_vh=v.stride(1),
+            stride_ts=None,
+            stride_om=out.stride(0),
+            stride_oh=out.stride(1),
+            alpha=alpha,
+            Z=Z,
+            H=H,
+            MAX_SEQ_LEN=N,
+            AUTOTUNE_MAX_SEQ_LEN=autotune_max_seq_len(N),
+            DimQ=DimQ,
+            DimV=DimV,
+            DeltaSize=0,
+            num_buckets=None,
+            max_pos_ind=None,
+            time_bucket_incr=None,
+            time_bucket_div=None,
+            time_delta=None,
+            contextual_seq_len=0 if contextual_seq_len is None else contextual_seq_len,
+            INVALID_MASK_TYPE=invalid_attn_mask_type,
+            CAUSAL=None,
+            BUCKET_FN="none",
+            ATTN_BIAS_TYPE="separate" if has_attn_bias else "none",
+            USE_TIME_BIAS=False,
+            USE_POS_BIAS=False,
+            HAS_MAX_POS_IND=False,
+            HAS_MULTIPLE_TARGETS=has_multiple_targets,
+            IS_DELTA_Q=False,
+            ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+            BLOCK_D_Q=DimQ,
+            BLOCK_D_V=DimV,
+            MAX_ATTN_LEN=max_attn_len,
+            HAS_CONTEXTUAL_SEQ_LEN=has_contextual_seq_len,
+            HAS_SORT_BY_LENGTH_INDICES=has_sort_by_length_indices,
+        )
+    else:
+        _ragged_hstu_attn_fwd[grid](
+            Q=q,
+            K=k,
+            V=v,
+            sort_by_length_indices=sort_by_length_indices,
+            seq_offsets=seq_offsets,
+            TS=None,
+            TW=None,
+            PW=None,
+            Bias=attn_bias,
+            seq2_offsets=seq2_offsets,
+            delta_x_offsets=None,
+            num_targets=num_targets,
+            Out=out,
+            stride_qm=q.stride(0),
+            stride_qh=q.stride(1),
+            stride_kn=k.stride(0),
+            stride_kh=k.stride(1),
+            stride_vn=v.stride(0),
+            stride_vh=v.stride(1),
+            stride_ts=None,
+            stride_om=out.stride(0),
+            stride_oh=out.stride(1),
+            alpha=alpha,
+            Z=Z,
+            H=H,
+            MAX_SEQ_LEN=N,
+            AUTOTUNE_MAX_SEQ_LEN=autotune_max_seq_len(N),
+            DimQ=DimQ,
+            DimV=DimV,
+            DeltaSize=0,
+            num_buckets=None,
+            max_pos_ind=None,
+            time_bucket_incr=None,
+            time_bucket_div=None,
+            time_delta=None,
+            contextual_seq_len=0 if contextual_seq_len is None else contextual_seq_len,
+            INVALID_MASK_TYPE=invalid_attn_mask_type,
+            CAUSAL=None,
+            BUCKET_FN="none",
+            ATTN_BIAS_TYPE="separate" if has_attn_bias else "none",
+            USE_TIME_BIAS=False,
+            USE_POS_BIAS=False,
+            HAS_MAX_POS_IND=False,
+            HAS_MULTIPLE_TARGETS=has_multiple_targets,
+            IS_DELTA_Q=False,
+            ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+            BLOCK_D_Q=DimQ,
+            BLOCK_D_V=DimV,
+            MAX_ATTN_LEN=max_attn_len,
+            HAS_CONTEXTUAL_SEQ_LEN=has_contextual_seq_len,
+            HAS_SORT_BY_LENGTH_INDICES=has_sort_by_length_indices,
+        )
+
     return out
 
 
@@ -2480,6 +2723,7 @@ class RaggedAttentionFunction(torch.autograd.Function):
         max_attn_len: Optional[int],
         contextual_seq_len: Optional[int],
         sort_by_length: bool,
+        enable_ws: bool,
     ) -> torch.Tensor:
         sort_by_length_indices = None
         if sort_by_length:
@@ -2520,6 +2764,7 @@ class RaggedAttentionFunction(torch.autograd.Function):
             max_attn_len=max_attn_len,
             contextual_seq_len=contextual_seq_len,
             sort_by_length_indices=sort_by_length_indices,
+            enable_ws=enable_ws,
         )
 
     @staticmethod
@@ -2990,6 +3235,7 @@ def triton_ragged_attention_relative_bias_fwd(
     use_pos_bias: bool,
     contextual_seq_len: Optional[int],
     sort_by_length_indices: Optional[torch.Tensor],
+    enable_ws: bool,
 ) -> torch.Tensor:
     Z = timestamps.size(0)
     N = timestamps.size(1) - 1
@@ -3009,59 +3255,115 @@ def triton_ragged_attention_relative_bias_fwd(
 
     contextual_seq_len = 0 if contextual_seq_len is None else contextual_seq_len
 
-    _ragged_hstu_attn_fwd[grid](
-        Q=q,
-        K=k,
-        V=v,
-        sort_by_length_indices=sort_by_length_indices,
-        seq_offsets=seq_offsets,
-        TS=timestamps,
-        TW=ts_weights,
-        PW=pos_weights,
-        Bias=None,
-        seq2_offsets=None,
-        delta_x_offsets=None,
-        num_targets=num_targets,
-        Out=out,
-        stride_qm=q.stride(0),
-        stride_qh=q.stride(1),
-        stride_kn=k.stride(0),
-        stride_kh=k.stride(1),
-        stride_vn=v.stride(0),
-        stride_vh=v.stride(1),
-        stride_ts=timestamps.stride(0),
-        stride_om=out.stride(0),
-        stride_oh=out.stride(1),
-        alpha=alpha,
-        Z=Z,
-        H=H,
-        MAX_SEQ_LEN=N,
-        AUTOTUNE_MAX_SEQ_LEN=autotune_max_seq_len(N),
-        DimQ=DimQ,
-        DimV=DimV,
-        DeltaSize=0,
-        num_buckets=num_buckets,
-        max_pos_ind=max_pos_ind,
-        time_bucket_incr=time_bucket_incr,
-        time_bucket_div=time_bucket_div,
-        time_delta=time_delta,
-        contextual_seq_len=contextual_seq_len,
-        INVALID_MASK_TYPE=invalid_attn_mask_type,
-        CAUSAL=causal,
-        BUCKET_FN=time_bucket_fn,
-        ATTN_BIAS_TYPE="fused",
-        USE_TIME_BIAS=use_time_bias,
-        USE_POS_BIAS=use_pos_bias,
-        HAS_MAX_POS_IND=has_max_pos_id,
-        HAS_MULTIPLE_TARGETS=has_multiple_targets,
-        IS_DELTA_Q=False,
-        ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
-        BLOCK_D_Q=DimQ,
-        BLOCK_D_V=DimV,
-        MAX_ATTN_LEN=max_attn_len or 0,
-        HAS_CONTEXTUAL_SEQ_LEN=has_contextual_seq_len,
-        HAS_SORT_BY_LENGTH_INDICES=has_sort_by_length_indices,
-    )
+    if enable_ws:
+        _ragged_hstu_attn_fwd_ws[grid](
+            Q=q,
+            K=k,
+            V=v,
+            sort_by_length_indices=sort_by_length_indices,
+            seq_offsets=seq_offsets,
+            TS=timestamps,
+            TW=ts_weights,
+            PW=pos_weights,
+            Bias=None,
+            seq2_offsets=None,
+            delta_x_offsets=None,
+            num_targets=num_targets,
+            Out=out,
+            stride_qm=q.stride(0),
+            stride_qh=q.stride(1),
+            stride_kn=k.stride(0),
+            stride_kh=k.stride(1),
+            stride_vn=v.stride(0),
+            stride_vh=v.stride(1),
+            stride_ts=timestamps.stride(0),
+            stride_om=out.stride(0),
+            stride_oh=out.stride(1),
+            alpha=alpha,
+            Z=Z,
+            H=H,
+            MAX_SEQ_LEN=N,
+            AUTOTUNE_MAX_SEQ_LEN=autotune_max_seq_len(N),
+            DimQ=DimQ,
+            DimV=DimV,
+            DeltaSize=0,
+            num_buckets=num_buckets,
+            max_pos_ind=max_pos_ind,
+            time_bucket_incr=time_bucket_incr,
+            time_bucket_div=time_bucket_div,
+            time_delta=time_delta,
+            contextual_seq_len=contextual_seq_len,
+            INVALID_MASK_TYPE=invalid_attn_mask_type,
+            CAUSAL=causal,
+            BUCKET_FN=time_bucket_fn,
+            ATTN_BIAS_TYPE="fused",
+            USE_TIME_BIAS=use_time_bias,
+            USE_POS_BIAS=use_pos_bias,
+            HAS_MAX_POS_IND=has_max_pos_id,
+            HAS_MULTIPLE_TARGETS=has_multiple_targets,
+            IS_DELTA_Q=False,
+            ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+            BLOCK_D_Q=DimQ,
+            BLOCK_D_V=DimV,
+            MAX_ATTN_LEN=max_attn_len or 0,
+            HAS_CONTEXTUAL_SEQ_LEN=has_contextual_seq_len,
+            HAS_SORT_BY_LENGTH_INDICES=has_sort_by_length_indices,
+        )
+    else:
+        _ragged_hstu_attn_fwd[grid](
+            Q=q,
+            K=k,
+            V=v,
+            sort_by_length_indices=sort_by_length_indices,
+            seq_offsets=seq_offsets,
+            TS=timestamps,
+            TW=ts_weights,
+            PW=pos_weights,
+            Bias=None,
+            seq2_offsets=None,
+            delta_x_offsets=None,
+            num_targets=num_targets,
+            Out=out,
+            stride_qm=q.stride(0),
+            stride_qh=q.stride(1),
+            stride_kn=k.stride(0),
+            stride_kh=k.stride(1),
+            stride_vn=v.stride(0),
+            stride_vh=v.stride(1),
+            stride_ts=timestamps.stride(0),
+            stride_om=out.stride(0),
+            stride_oh=out.stride(1),
+            alpha=alpha,
+            Z=Z,
+            H=H,
+            MAX_SEQ_LEN=N,
+            AUTOTUNE_MAX_SEQ_LEN=autotune_max_seq_len(N),
+            DimQ=DimQ,
+            DimV=DimV,
+            DeltaSize=0,
+            num_buckets=num_buckets,
+            max_pos_ind=max_pos_ind,
+            time_bucket_incr=time_bucket_incr,
+            time_bucket_div=time_bucket_div,
+            time_delta=time_delta,
+            contextual_seq_len=contextual_seq_len,
+            INVALID_MASK_TYPE=invalid_attn_mask_type,
+            CAUSAL=causal,
+            BUCKET_FN=time_bucket_fn,
+            ATTN_BIAS_TYPE="fused",
+            USE_TIME_BIAS=use_time_bias,
+            USE_POS_BIAS=use_pos_bias,
+            HAS_MAX_POS_IND=has_max_pos_id,
+            HAS_MULTIPLE_TARGETS=has_multiple_targets,
+            IS_DELTA_Q=False,
+            ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+            BLOCK_D_Q=DimQ,
+            BLOCK_D_V=DimV,
+            MAX_ATTN_LEN=max_attn_len or 0,
+            HAS_CONTEXTUAL_SEQ_LEN=has_contextual_seq_len,
+            HAS_SORT_BY_LENGTH_INDICES=has_sort_by_length_indices,
+        )
+
     return out
 
 
@@ -3319,6 +3621,7 @@ class RaggedAttentionRelativeBiasFunction(torch.autograd.Function):
         max_attn_len: Optional[int],
         contextual_seq_len: Optional[int],
         sort_by_length: bool,
+        enable_ws: bool,
     ) -> torch.Tensor:
         use_time_bias = relative_bias_type == "TIME" or relative_bias_type == "ALL"
         use_pos_bias = relative_bias_type == "POSITION" or relative_bias_type == "ALL"
@@ -3385,6 +3688,7 @@ class RaggedAttentionRelativeBiasFunction(torch.autograd.Function):
             use_pos_bias=use_pos_bias,
             contextual_seq_len=contextual_seq_len,
             sort_by_length_indices=sort_by_length_indices,
+            enable_ws=enable_ws,
         )
 
     @staticmethod
